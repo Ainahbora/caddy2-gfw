@@ -1,119 +1,137 @@
-# Caddy GFW 扩展
+# Caddy2-GFW
 
-这是一个Caddy v2的扩展模块，用于检测恶意请求，自动拦截不合法请求并返回403状态码，同时将恶意IP上报到指定API。
+Caddy2-GFW 是一个用于 Caddy 服务器的 HTTP 请求过滤模块，用于检测和拦截恶意请求。
 
-## 功能特性
+## 功能特点
 
-- 自动检测恶意请求并拦截
-- 将不合法请求的IP加入黑名单
-- 支持自定义拦截规则（IP地址、URL路径和User-Agent）
-- 支持自定义上报API地址
-- 异步上报恶意IP信息
-- 自动拦截直接使用IP访问80和443端口的请求（无域名）
-
-## 规则类型说明
-
-GFW模块支持三种类型的拦截规则：
-
-1. **IP地址规则**：直接填写IP地址，如 `192.168.1.100`，将匹配来自该IP的请求
-2. **URL路径规则**：以 `/` 开头的规则，如 `/admin`，将匹配请求路径等于或以该路径开头的请求
-3. **User-Agent规则**：不符合上述两种格式的规则，如 `malicious-bot`，将匹配包含该字符串的User-Agent
+- 支持多种规则类型：
+  - IP地址/网段规则
+  - URL路径规则
+  - User-Agent规则
+- 规则文件自动刷新
+- 可配置的黑名单TTL
+- 自动清理过期黑名单
+- 支持规则文件注释
+- 线程安全的规则匹配
 
 ## 安装
 
-### 使用xcaddy构建
-
 ```bash
+# 使用 xcaddy 构建
 xcaddy build --with github.com/ysicing/caddy2-gfw
 ```
 
-### 使用go install
+## 配置示例
 
-```bash
-go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-xcaddy build --with github.com/ysicing/caddy2-gfw
-```
-
-## 配置
-
-### Caddyfile 配置示例
+### Caddyfile 配置
 
 ```caddyfile
+# 全局配置
 {
-  order gfw before respond
-}
-
-example.com {
-  gfw {
-    # 方式一：直接在配置中添加规则
-    block_rule "malicious-bot"  # User-Agent规则
-    block_rule "bad-crawler"    # User-Agent规则
-    block_rule "/admin"        # URL路径规则
-    block_rule "192.168.1.100" # IP地址规则
-
-    # 方式二：从文件加载规则（适合管理大量规则）
-    block_rule_file /path/to/block.rule
-
-    # 设置黑名单过期时间为2小时
-    ttl 2h
-    # 注意：模块会自动拦截直接使用IP访问的请求（无需额外配置）
-  }
-  respond "Hello, World!"
-}
-```
-
-### JSON 配置示例
-
-```json
-{
-  "apps": {
-    "http": {
-      "servers": {
-        "example": {
-          "listen": [":80"],
-          "routes": [
-            {
-              "handle": [
-                {
-                  "handler": "gfw",
-                  "block_rules": [
-                    "malicious-bot",  // User-Agent规则
-                    "bad-crawler",    // User-Agent规则
-                    "/admin",         // URL路径规则
-                    "192.168.1.100"   // IP地址规则
-                  ],
-                  "block_rule_file": "/path/to/block.rule", // 从文件加载规则
-                  "_comment": "模块会自动拦截直接使用IP访问的请求（无需额外配置）"
-                },
-                {
-                  "handler": "static_response",
-                  "body": "Hello, World!"
-                }
-              ]
-            }
-          ]
-        }
-      }
+    # 启用自动HTTPS
+    auto_https disable_redirects
+    # 设置日志级别
+    log {
+        level INFO
     }
-  }
+}
+
+# 示例站点配置
+:80 {
+    # 启用GFW模块
+    gfw {
+        # 规则文件路径
+        block_rule_file /etc/caddy/rules.txt
+        # 黑名单IP的TTL时间
+        ttl 24h
+        # 直接配置的规则（可选）
+        block_rule ip:192.168.1.1
+        block_rule url:/admin
+        block_rule ua:curl
+    }
+
+    # 反向代理配置
+    reverse_proxy localhost:8080
 }
 ```
+
+### 规则文件格式
+
+规则文件支持以下格式：
+
+```text
+# IP规则
+ip:192.168.1.1
+ip:10.0.0.0/24
+
+# URL规则
+url:/admin
+url:/wp-login.php
+
+# User-Agent规则
+ua:curl
+ua:wget
+```
+
+## 规则类型说明
+
+1. IP规则
+   - 支持单个IP地址：`ip:192.168.1.1`
+   - 支持CIDR格式：`ip:10.0.0.0/24`
+
+2. URL规则
+   - 支持路径匹配：`url:/admin`
+   - 支持文件匹配：`url:/wp-login.php`
+
+3. User-Agent规则
+   - 支持完整匹配：`ua:curl`
+   - 支持部分匹配：`ua:python-requests`
 
 ## 配置选项
 
-| 选项 | 说明 | 默认值 |
-|------|------|--------|
-| `block_rule` | 添加单条拦截规则，可以多次指定 | 无 |
-| `block_rule_file` | 从文件加载拦截规则，每行一条规则 | 无 |
+- `block_rule_file`: 规则文件路径
+- `ttl`: 黑名单IP的TTL时间，默认为24小时
+- `block_rule`: 直接在配置中添加规则
 
-## 工作原理
+## 日志说明
 
-1. 模块会检查每个HTTP请求的合法性
-2. 自动检测并拦截直接使用IP地址访问80和443端口的请求（无域名访问）
-3. 如果请求被判定为不合法，将返回403状态码
-4. 同时将该IP加入黑名单，默认有效期为1小时
-5. 异步将恶意IP信息上报到指定API
+模块会记录以下类型的日志：
+
+1. 初始化日志
+   - 规则文件加载状态
+   - 配置参数信息
+
+2. 请求处理日志
+   - 黑名单IP拦截
+   - 规则匹配拦截
+   - 恶意请求检测
+
+3. 维护日志
+   - 规则文件更新
+   - 黑名单清理
+
+## 注意事项
+
+1. 规则文件格式
+   - 每行一条规则
+   - 支持#开头的注释行
+   - 支持空行
+   - 规则格式必须正确
+
+2. 性能考虑
+   - 规则文件不宜过大
+   - 建议定期清理过期规则
+   - 合理设置TTL时间
+
+3. 安全建议
+   - 定期更新规则文件
+   - 监控日志文件
+   - 及时处理异常请求
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
 
 ## 许可证
 
-MIT
+MIT License

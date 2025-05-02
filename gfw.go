@@ -1,8 +1,12 @@
 package gfw
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +50,79 @@ type GFW struct {
 	ruleCache   *RuleCache
 	stopChan    chan struct{}
 	done        chan struct{} // 用于等待清理协程完成
+	lastModTime time.Time     // 规则文件最后修改时间
+}
+
+// RuleCache 规则缓存
+type RuleCache struct {
+	mu     sync.RWMutex
+	rules  map[string]struct{}
+	ipSet  map[string]struct{}
+	urlSet map[string]struct{}
+	uaSet  map[string]struct{}
+}
+
+// NewRuleCache 创建新的规则缓存
+func NewRuleCache() *RuleCache {
+	return &RuleCache{
+		rules:  make(map[string]struct{}),
+		ipSet:  make(map[string]struct{}),
+		urlSet: make(map[string]struct{}),
+		uaSet:  make(map[string]struct{}),
+	}
+}
+
+// AddRule 添加规则到缓存
+func (rc *RuleCache) AddRule(rule string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	rc.rules[rule] = struct{}{}
+
+	// 根据规则类型添加到对应的集合
+	if strings.HasPrefix(rule, "ip:") {
+		rc.ipSet[rule[3:]] = struct{}{}
+	} else if strings.HasPrefix(rule, "url:") {
+		rc.urlSet[rule[4:]] = struct{}{}
+	} else if strings.HasPrefix(rule, "ua:") {
+		rc.uaSet[rule[3:]] = struct{}{}
+	}
+}
+
+// MatchIP 检查IP是否匹配规则
+func (rc *RuleCache) MatchIP(ip string) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	_, exists := rc.ipSet[ip]
+	return exists
+}
+
+// MatchURL 检查URL是否匹配规则
+func (rc *RuleCache) MatchURL(url string) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	_, exists := rc.urlSet[url]
+	return exists
+}
+
+// MatchUserAgent 检查User-Agent是否匹配规则
+func (rc *RuleCache) MatchUserAgent(ua string) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	_, exists := rc.uaSet[ua]
+	return exists
+}
+
+// GetAllRules 返回所有规则
+func (rc *RuleCache) GetAllRules() map[string]struct{} {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	rules := make(map[string]struct{}, len(rc.rules))
+	for rule := range rc.rules {
+		rules[rule] = struct{}{}
+	}
+	return rules
 }
 
 // CaddyModule 返回Caddy模块信息
@@ -79,6 +156,8 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 				zap.String("file", g.BlockRuleFile))
 			// 继续执行，不因为规则文件加载失败而中断服务
 		}
+		// 启动规则文件监控
+		go g.watchRuleFile()
 	}
 
 	// 启动黑名单清理协程
@@ -236,6 +315,113 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 	return true
 }
 
+// loadRulesFromFile 从文件中加载规则
+func (g *GFW) loadRulesFromFile() error {
+	// 获取文件信息
+	fileInfo, err := os.Stat(g.BlockRuleFile)
+	if err != nil {
+		return fmt.Errorf("获取规则文件信息失败: %w", err)
+	}
+
+	// 更新最后修改时间
+	g.lastModTime = fileInfo.ModTime()
+
+	// 打开规则文件
+	file, err := os.Open(g.BlockRuleFile)
+	if err != nil {
+		return fmt.Errorf("打开规则文件失败: %w", err)
+	}
+	defer file.Close()
+
+	// 创建新的规则缓存
+	newCache := NewRuleCache()
+
+	// 逐行读取规则
+	scanner := bufio.NewScanner(file)
+	lineCount := 0
+	ruleCount := 0
+
+	for scanner.Scan() {
+		lineCount++
+		line := strings.TrimSpace(scanner.Text())
+
+		// 跳过空行和注释行
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 添加到规则缓存
+		newCache.AddRule(line)
+		ruleCount++
+	}
+
+	// 检查是否有扫描错误
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取规则文件失败: %w", err)
+	}
+
+	// 更新规则缓存
+	g.ruleCache = newCache
+
+	// 更新内存中的规则列表
+	g.BlockRules = make([]string, 0, ruleCount)
+	for rule := range newCache.GetAllRules() {
+		g.BlockRules = append(g.BlockRules, rule)
+	}
+
+	g.logger.Info("从文件加载规则成功",
+		zap.String("file", g.BlockRuleFile),
+		zap.Int("total_lines", lineCount),
+		zap.Int("rules_loaded", ruleCount),
+		zap.Time("last_modified", g.lastModTime))
+
+	return nil
+}
+
+// checkAndReloadRules 检查并重新加载规则
+func (g *GFW) checkAndReloadRules() error {
+	// 获取文件信息
+	fileInfo, err := os.Stat(g.BlockRuleFile)
+	if err != nil {
+		return fmt.Errorf("获取规则文件信息失败: %w", err)
+	}
+
+	// 检查文件是否被修改
+	if fileInfo.ModTime().Equal(g.lastModTime) {
+		return nil
+	}
+
+	// 重新加载规则
+	if err := g.loadRulesFromFile(); err != nil {
+		return fmt.Errorf("重新加载规则失败: %w", err)
+	}
+
+	g.logger.Info("规则文件已更新",
+		zap.String("file", g.BlockRuleFile),
+		zap.Time("last_modified", fileInfo.ModTime()))
+
+	return nil
+}
+
+// watchRuleFile 监控规则文件变化
+func (g *GFW) watchRuleFile() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := g.checkAndReloadRules(); err != nil {
+				g.logger.Error("检查规则文件更新失败",
+					zap.Error(err),
+					zap.String("file", g.BlockRuleFile))
+			}
+		case <-g.stopChan:
+			return
+		}
+	}
+}
+
 // parseCaddyfile 解析Caddyfile配置
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var g GFW
@@ -279,7 +465,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 var (
 	_ caddy.Provisioner           = (*GFW)(nil)
 	_ caddy.Validator             = (*GFW)(nil)
-	_ caddy.Cleaner               = (*GFW)(nil)
 	_ caddyhttp.MiddlewareHandler = (*GFW)(nil)
 	_ caddyfile.Unmarshaler       = (*GFW)(nil)
 )

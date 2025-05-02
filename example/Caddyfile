@@ -1,20 +1,25 @@
-{
-  order gfw before respond
+# 示例站点配置
+:80 {
+    # 启用GFW模块
+    gfw {
+        # 规则文件路径
+        block_rule_file ./rules.txt
+        # 黑名单IP的TTL时间
+        ttl 24h
+        # 直接配置的规则（可选）
+        block_rule ip:192.168.1.1
+        block_rule url:/admin
+        block_rule ua:curl
+    }
+    respond "Hello, 80 port"
 }
 
-localhost {
-  # 启用GFW模块进行请求过滤
-  gfw {
-
-    # 从文件加载拦截规则
-    block_rule_file block.rule
-
-    # 也可以直接在配置中添加规则
-    block_rule "malicious-bot"    # User-Agent规则
-    block_rule "bad-crawler"      # User-Agent规则
-    block_rule "/admin"          # URL路径规则
-  }
-
-  # 正常响应
-  respond "Hello, 这是一个受GFW模块保护的网站!"
+# HTTPS站点配置
+http://127.0.0.1.sslip.io:80 {
+    # 启用GFW模块
+    gfw {
+        block_rule_file ./rules.txt
+        ttl 24h
+    }
+    respond "Hello, 127.0.0.1.sslip.io"
 }
