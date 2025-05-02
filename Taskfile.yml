@@ -1,0 +1,54 @@
+version: '3'
+
+vars:
+  BINARY_NAME: caddy
+  MODULE_NAME: github.com/ysicing/caddy2-gfw
+  GO_VERSION: 1.24.2
+
+tasks:
+
+  gomod:
+    desc: update go mod
+    run: once
+    cmds:
+      - go mod tidy
+
+  gofmt:
+    desc: format go code
+    cmds:
+      - go install golang.org/x/tools/cmd/goimports@latest
+      - gofmt -s -w .
+      - goimports -w .
+
+  govulncheck:
+    desc: Vulnerability detection
+    cmds:
+      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      - govulncheck ./...
+
+  gci:
+    desc: gci
+    cmds:
+      - go install github.com/daixiang0/gci@latest
+      - gci write --skip-generated --custom-order -s standard -s "prefix(gitea.ysicing.net/cloud/jika)" -s default -s blank -s dot .
+
+
+  fmt:
+    desc: format code
+    cmds:
+      - task: gomod
+      - task: gofmt
+      - task: govulncheck
+      - task: gci
+
+  build:
+    desc: build caddy
+    deps:
+      - task: fmt
+    cmds:
+      - go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+      - xcaddy build
+          --with github.com/ysicing/caddy2-gfw=../caddy2-gfw
+      - ./caddy list-modules
+
+

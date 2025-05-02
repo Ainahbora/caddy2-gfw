@@ -1,0 +1,21 @@
+# GFW拦截规则文件
+# 每行一条规则，支持以下格式：
+# 1. IP地址规则 (例如: 192.168.1.100)
+# 2. URL路径规则 (以/开头，例如: /admin)
+# 3. User-Agent规则 (例如: bad-crawler)
+
+# IP地址规则
+192.168.1.100
+192.168.1.101
+
+# URL路径规则
+/admin
+/wp-login.php
+/wp-admin
+
+# User-Agent规则
+malicious-bot
+bad-crawler
+suspicious-agent
+scanner
+exploit-scanner

@@ -1,0 +1,32 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "example": {
+          "listen": [":80"],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "gfw",
+                  "report_url": "https://api.baidu.com/report",
+                  "block_rules": [
+                    "malicious-bot",
+                    "bad-crawler",
+                    "suspicious-agent",
+                    "/admin",
+                    "192.168.1.100"
+                  ]
+                },
+                {
+                  "handler": "static_response",
+                  "body": "Hello, 这是一个受GFW模块保护的网站!"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
