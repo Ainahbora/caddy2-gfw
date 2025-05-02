@@ -146,7 +146,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		g.logger.Info("拦截黑名单IP的请求",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path))
-		w.WriteHeader(http.StatusForbidden)
+		http.Error(w, "blocked by gfw", http.StatusForbidden)
 		return nil
 	}
 
@@ -163,7 +163,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 			zap.String("user_agent", r.UserAgent()))
 
 		// 返回403状态码
-		w.WriteHeader(http.StatusForbidden)
+		http.Error(w, "blocked by gfw", http.StatusForbidden)
 		return nil
 	}
 
