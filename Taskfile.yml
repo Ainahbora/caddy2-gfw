@@ -30,8 +30,7 @@ tasks:
     desc: gci
     cmds:
       - go install github.com/daixiang0/gci@latest
-      - gci write --skip-generated --custom-order -s standard -s "prefix(gitea.ysicing.net/cloud/jika)" -s default -s blank -s dot .
-
+      - gci write --skip-generated --custom-order -s standard -s "prefix(github.com/ysicing/caddy2-gfw)" -s default -s blank -s dot .
 
   fmt:
     desc: format code

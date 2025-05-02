@@ -45,17 +45,17 @@ xcaddy build --with github.com/ysicing/caddy2-gfw
 
 example.com {
   gfw {
-    report_url https://api.baidu.com/report
-    
     # 方式一：直接在配置中添加规则
     block_rule "malicious-bot"  # User-Agent规则
     block_rule "bad-crawler"    # User-Agent规则
     block_rule "/admin"        # URL路径规则
     block_rule "192.168.1.100" # IP地址规则
-    
+
     # 方式二：从文件加载规则（适合管理大量规则）
     block_rule_file /path/to/block.rule
-    
+
+    # 设置黑名单过期时间为2小时
+    ttl 2h
     # 注意：模块会自动拦截直接使用IP访问的请求（无需额外配置）
   }
   respond "Hello, World!"
@@ -76,7 +76,6 @@ example.com {
               "handle": [
                 {
                   "handler": "gfw",
-                  "report_url": "https://api.baidu.com/report",
                   "block_rules": [
                     "malicious-bot",  // User-Agent规则
                     "bad-crawler",    // User-Agent规则
@@ -104,7 +103,6 @@ example.com {
 
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
-| `report_url` | 恶意IP上报的API地址 | `https://api.baidu.com/report` |
 | `block_rule` | 添加单条拦截规则，可以多次指定 | 无 |
 | `block_rule_file` | 从文件加载拦截规则，每行一条规则 | 无 |
 

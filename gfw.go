@@ -1,4 +1,3 @@
-// Package gfw 提供Caddy的HTTP请求过滤扩展，用于检测恶意请求
 package gfw
 
 import (
@@ -17,20 +16,15 @@ import (
 // 常量定义
 const (
 	// 默认配置
-	defaultBlacklistTTL    = 1 * time.Hour
+	defaultBlacklistTTL    = 24 * time.Hour
 	defaultCleanupInterval = 5 * time.Minute
-
-	// 错误信息
-	errInvalidConfig     = "invalid configuration"
-	errRuleFileNotFound  = "rule file not found"
-	errRuleFileReadError = "failed to read rule file"
 )
 
 // 错误定义
 var (
-	ErrInvalidConfig     = errors.New(errInvalidConfig)
-	ErrRuleFileNotFound  = errors.New(errRuleFileNotFound)
-	ErrRuleFileReadError = errors.New(errRuleFileReadError)
+	ErrInvalidConfig     = errors.New("invalid configuration")
+	ErrRuleFileNotFound  = errors.New("rule file not found")
+	ErrRuleFileReadError = errors.New("failed to read rule file")
 )
 
 func init() {
@@ -41,8 +35,9 @@ func init() {
 // GFW 实现了一个Caddy HTTP处理器，用于检测恶意请求
 type GFW struct {
 	// 配置选项
-	BlockRules    []string `json:"block_rules,omitempty"`
-	BlockRuleFile string   `json:"block_rule_file,omitempty"`
+	BlockRules    []string      `json:"block_rules,omitempty"`
+	BlockRuleFile string        `json:"block_rule_file,omitempty"`
+	TTL           time.Duration `json:"ttl,omitempty"`
 
 	// 内部状态
 	blackList   map[string]time.Time
@@ -50,6 +45,7 @@ type GFW struct {
 	logger      *zap.Logger
 	ruleCache   *RuleCache
 	stopChan    chan struct{}
+	done        chan struct{} // 用于等待清理协程完成
 }
 
 // CaddyModule 返回Caddy模块信息
@@ -65,6 +61,12 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	g.logger = ctx.Logger()
 	g.blackList = make(map[string]time.Time)
 	g.stopChan = make(chan struct{})
+	g.done = make(chan struct{})
+
+	// 设置默认值
+	if g.TTL == 0 {
+		g.TTL = defaultBlacklistTTL
+	}
 
 	// 初始化规则缓存
 	g.ruleCache = NewRuleCache()
@@ -84,13 +86,22 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 
 	g.logger.Info("GFW模块已初始化",
 		zap.String("block_rule_file", g.BlockRuleFile),
-		zap.Strings("block_rules", g.BlockRules))
+		zap.Strings("block_rules", g.BlockRules),
+		zap.Duration("ttl", g.TTL))
 
+	return nil
+}
+
+// Cleanup 实现caddy.Cleaner接口，清理资源
+func (g *GFW) Cleanup() error {
+	close(g.stopChan)
+	<-g.done // 等待清理协程完成
 	return nil
 }
 
 // cleanupBlacklist 定期清理过期的黑名单记录
 func (g *GFW) cleanupBlacklist() {
+	defer close(g.done)
 	ticker := time.NewTicker(defaultCleanupInterval)
 	defer ticker.Stop()
 
@@ -99,6 +110,8 @@ func (g *GFW) cleanupBlacklist() {
 		case <-ticker.C:
 			g.cleanup()
 		case <-g.stopChan:
+			// 最后一次清理
+			g.cleanup()
 			return
 		}
 	}
@@ -111,18 +124,25 @@ func (g *GFW) cleanup() {
 
 	now := time.Now()
 	expiredCount := 0
+	expiredIPs := make([]string, 0)
 
 	for ip, expireTime := range g.blackList {
 		if now.After(expireTime) {
-			delete(g.blackList, ip)
+			expiredIPs = append(expiredIPs, ip)
 			expiredCount++
 		}
+	}
+
+	// 批量删除过期记录
+	for _, ip := range expiredIPs {
+		delete(g.blackList, ip)
 	}
 
 	if expiredCount > 0 {
 		g.logger.Debug("清理过期黑名单记录",
 			zap.Int("expired_count", expiredCount),
-			zap.Int("remaining_count", len(g.blackList)))
+			zap.Int("remaining_count", len(g.blackList)),
+			zap.Strings("expired_ips", expiredIPs))
 	}
 }
 
@@ -152,9 +172,9 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	// 检查请求是否合法
 	if !g.isRequestLegal(r) {
-		// 将IP加入黑名单，有效期1小时
+		// 将IP加入黑名单，使用配置的TTL
 		g.blackListMu.Lock()
-		g.blackList[clientIP] = time.Now().Add(defaultBlacklistTTL)
+		g.blackList[clientIP] = time.Now().Add(g.TTL)
 		g.blackListMu.Unlock()
 
 		g.logger.Warn("检测到恶意请求",
@@ -236,6 +256,16 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.BlockRuleFile = h.Val()
 
+			case "ttl":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				duration, err := time.ParseDuration(h.Val())
+				if err != nil {
+					return nil, h.Errf("invalid ttl duration: %v", err)
+				}
+				g.TTL = duration
+
 			default:
 				return nil, h.Errf("unknown subdirective '%s'", h.Val())
 			}
@@ -249,6 +279,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 var (
 	_ caddy.Provisioner           = (*GFW)(nil)
 	_ caddy.Validator             = (*GFW)(nil)
+	_ caddy.Cleaner               = (*GFW)(nil)
 	_ caddyhttp.MiddlewareHandler = (*GFW)(nil)
 	_ caddyfile.Unmarshaler       = (*GFW)(nil)
 )
@@ -269,6 +300,16 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				g.BlockRuleFile = d.Val()
+
+			case "ttl":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				duration, err := time.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid ttl duration: %v", err)
+				}
+				g.TTL = duration
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())

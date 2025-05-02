@@ -5,18 +5,16 @@
 localhost {
   # 启用GFW模块进行请求过滤
   gfw {
-    # 设置恶意IP上报地址
-    report_url https://api.baidu.com/report
-    
+
     # 从文件加载拦截规则
     block_rule_file block.rule
-    
+
     # 也可以直接在配置中添加规则
     block_rule "malicious-bot"    # User-Agent规则
     block_rule "bad-crawler"      # User-Agent规则
     block_rule "/admin"          # URL路径规则
   }
-  
+
   # 正常响应
   respond "Hello, 这是一个受GFW模块保护的网站!"
 }

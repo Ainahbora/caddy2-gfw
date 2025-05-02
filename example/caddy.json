@@ -9,7 +9,6 @@
               "handle": [
                 {
                   "handler": "gfw",
-                  "report_url": "https://api.baidu.com/report",
                   "block_rules": [
                     "malicious-bot",
                     "bad-crawler",
