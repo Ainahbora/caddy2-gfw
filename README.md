@@ -57,7 +57,7 @@ Caddy2-GFW 是一个基于 Caddy2 的 Web 应用防火墙模块，提供全面�
 ## 安装
 
 ```bash
-go install github.com/ysicing/caddy2-gfw@latest
+xcaddy build --with github.com/ysicing/caddy2-gfw
 ```
 
 ## 配置示例
