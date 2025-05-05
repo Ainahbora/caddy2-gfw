@@ -61,6 +61,8 @@ http://127.0.0.1.sslip.io:80 {
 	gfw {
 		block_rule_file ./rules.txt
 		ttl 24h
+		# 启用额外安全检测
+		enable_extra true
 	}
 	respond "Hello, 127.0.0.1.sslip.io"
 }
