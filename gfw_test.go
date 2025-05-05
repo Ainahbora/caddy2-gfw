@@ -8,7 +8,46 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+func init() {
+	// 测试环境初始化全局 metrics
+	registry := prometheus.NewRegistry()
+	const ns, sub = "caddy", "gfw"
+	requestsTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "requests_total",
+		Help:      "Total number of requests processed by GFW",
+	}, []string{"status"})
+	attackDetections = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "attack_detections_total",
+		Help:      "Total number of detected attacks by GFW",
+	}, []string{"type"})
+	blacklistSize = promauto.With(registry).NewGauge(prometheus.GaugeOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "blacklist_size",
+		Help:      "Current number of IPs in GFW blacklist",
+	})
+	ruleMatches = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "rule_matches_total",
+		Help:      "Total number of rule matches by GFW",
+	}, []string{"type"})
+	requestDuration = promauto.With(registry).NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "request_duration_seconds",
+		Help:      "Request processing duration by GFW in seconds",
+		Buckets:   prometheus.DefBuckets,
+	})
+}
 
 func TestGFW_Provision(t *testing.T) {
 	g := &GFW{}
@@ -331,31 +370,36 @@ func TestGFW_ServeHTTP(t *testing.T) {
 		name           string
 		query          string
 		expectedStatus int
+		remoteAddr     string
 	}{
 		{
 			name:           "正常请求",
 			query:          "",
 			expectedStatus: http.StatusOK,
+			remoteAddr:     "192.0.2.10:1234",
 		},
 		{
 			name:           "SQL注入请求",
 			query:          "id=1' OR '1'='1",
 			expectedStatus: http.StatusForbidden,
+			remoteAddr:     "192.0.2.11:1234",
 		},
 		{
 			name:           "XSS请求",
 			query:          "q=<script>alert(1)</script>",
 			expectedStatus: http.StatusForbidden,
+			remoteAddr:     "192.0.2.12:1234",
 		},
 	}
 
-	g := setupGFW(t)
-	g.EnableExtra = true // 启用额外安全检测
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			g := setupGFW(t)
+			g.EnableExtra = true // 启用额外安全检测
+
 			req := httptest.NewRequest("GET", "/", nil)
 			req.URL.RawQuery = tt.query
+			req.RemoteAddr = tt.remoteAddr
 			recorder := httptest.NewRecorder()
 			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				return nil
@@ -453,7 +497,7 @@ func TestGFW_ExtraSecurity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := setupGFW(t)
 			g.EnableExtra = tt.enableExtra
-			result := g.isRequestLegal(tt.request)
+			_, result := g.isRequestLegal(tt.request)
 			if result != tt.expectedResult {
 				t.Errorf("额外安全检测测试失败: %s, 期望结果: %v, 实际结果: %v", tt.name, tt.expectedResult, result)
 			}

@@ -210,6 +210,9 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	// 全局只注册一次 metrics
 	metricsOnce.Do(func() {
 		registry := ctx.GetMetricsRegistry()
+		if registry == nil {
+			return
+		}
 		const ns, sub = "caddy", "gfw"
 		requestsTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns,
@@ -678,11 +681,7 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 
 	// 检查原始查询字符串
 	rawQuery := r.URL.RawQuery
-	if strings.Contains(strings.ToLower(rawQuery), "drop table") {
-		return true
-	}
-
-	return false
+	return strings.Contains(strings.ToLower(rawQuery), "drop table")
 }
 
 // detectXSS 检测XSS攻击
