@@ -350,6 +350,7 @@ func TestGFW_ServeHTTP(t *testing.T) {
 	}
 
 	g := setupGFW(t)
+	g.EnableExtra = true // 启用额外安全检测
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -396,6 +397,67 @@ func TestGFW_Blacklist(t *testing.T) {
 
 	if recorder.Code != http.StatusForbidden {
 		t.Errorf("期望状态码 %d, 实际状态码 %d", http.StatusForbidden, recorder.Code)
+	}
+}
+
+func TestGFW_ExtraSecurity(t *testing.T) {
+	tests := []struct {
+		name           string
+		enableExtra    bool
+		request        *http.Request
+		expectedResult bool
+	}{
+		{
+			name:        "额外安全检测关闭 - SQL注入",
+			enableExtra: false,
+			request: func() *http.Request {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.URL.RawQuery = "id=1' OR '1'='1"
+				return req
+			}(),
+			expectedResult: true, // 请求应该通过，因为额外安全检测被禁用
+		},
+		{
+			name:        "额外安全检测开启 - SQL注入",
+			enableExtra: true,
+			request: func() *http.Request {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.URL.RawQuery = "id=1' OR '1'='1"
+				return req
+			}(),
+			expectedResult: false, // 请求应该被拒绝，因为检测到SQL注入
+		},
+		{
+			name:        "额外安全检测关闭 - XSS",
+			enableExtra: false,
+			request: func() *http.Request {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.URL.RawQuery = "q=<script>alert(1)</script>"
+				return req
+			}(),
+			expectedResult: true, // 请求应该通过，因为额外安全检测被禁用
+		},
+		{
+			name:        "额外安全检测开启 - XSS",
+			enableExtra: true,
+			request: func() *http.Request {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.URL.RawQuery = "q=<script>alert(1)</script>"
+				return req
+			}(),
+			expectedResult: false, // 请求应该被拒绝，因为检测到XSS
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := setupGFW(t)
+			g.EnableExtra = tt.enableExtra
+			result := g.isRequestLegal(tt.request)
+			if result != tt.expectedResult {
+				t.Errorf("额外安全检测测试失败: %s, 期望结果: %v, 实际结果: %v", tt.name, tt.expectedResult, result)
+			}
+		})
 	}
 }
 
