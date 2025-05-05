@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,15 @@ const (
 	// 默认配置
 	defaultBlacklistTTL    = 24 * time.Hour
 	defaultCleanupInterval = 5 * time.Minute
+
+	// 安全检测相关常量
+	sqlInjectionPatterns  = `(?i)(\b(select|insert|update|delete|drop|union|exec|where|from|into|load_file|outfile)\b.*\b(from|into|where|union|exec|load_file|outfile)\b|'.*'|".*"|\b(and|or)\b.*\b(1=1|2=2|true|false)\b|;.*\b(drop|delete|update|insert)\b|.*\bdrop\s+table\b)`
+	xssPatterns           = `(?i)(<script|javascript:|on\w+\s*=|data:|vbscript:|expression\s*\(|eval\s*\(|alert\s*\()`
+	csrfPatterns          = `(?i)(_csrf|csrf_token|xsrf_token)`
+	ssrfPatterns          = `(?i)(127\.0\.0\.1|localhost|0\.0\.0\.0|::1|file://|gopher://|dict://)`
+	cmdInjectionPatterns  = `(?i)(\b(cat|ls|rm|wget|curl|bash|sh|python|perl|ruby|php)\b.*\b(>|<|\||&|;)\b|\b(rm|del|remove)\s+(-rf?|/s|/q)\b|\b(cat|ls|rm|wget|curl)\b.*\b(/etc/passwd|/etc/shadow|/etc/hosts)\b|\bcat\s+/etc/passwd\b)`
+	codeInjectionPatterns = `(?i)(\b(eval|exec|system|passthru|shell_exec|assert|preg_replace)\s*\(.*\)|\b(include|require|include_once|require_once)\s*\(.*\))`
+	fileIncludePatterns   = `(?i)(\.\./|\.\.\\|\.\.\/|\.\.\\|\.\.\/\.\.\/|\.\.\\\.\.\\|\.\.\/\.\.\/\.\.\/|\.\.\\\.\.\\\.\.\\|php://|data://|phar://|zip://)`
 )
 
 // 错误定义
@@ -295,6 +306,48 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 		}
 	}
 
+	// 检查SQL注入
+	if g.detectSQLInjection(r) {
+		g.logger.Warn("检测到SQL注入攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查XSS攻击
+	if g.detectXSS(r) {
+		g.logger.Warn("检测到XSS攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查CSRF攻击
+	if g.detectCSRF(r) {
+		g.logger.Warn("检测到CSRF攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查SSRF攻击
+	if g.detectSSRF(r) {
+		g.logger.Warn("检测到SSRF攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查命令注入
+	if g.detectCommandInjection(r) {
+		g.logger.Warn("检测到命令注入攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查代码注入
+	if g.detectCodeInjection(r) {
+		g.logger.Warn("检测到代码注入攻击", zap.String("ip", clientIP))
+		return false
+	}
+
+	// 检查文件包含漏洞
+	if g.detectFileInclude(r) {
+		g.logger.Warn("检测到文件包含漏洞", zap.String("ip", clientIP))
+		return false
+	}
+
 	// 检查是否直接使用IP访问80或443端口（没有配置域名）
 	host := r.Host
 	// 检查Host是否为IP地址格式（简单判断是否包含字母）
@@ -313,6 +366,385 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 
 	// 默认认为请求合法
 	return true
+}
+
+// detectSQLInjection 检测SQL注入攻击
+func (g *GFW) detectSQLInjection(r *http.Request) bool {
+	// 检查URL参数
+	for key, values := range r.URL.Query() {
+		for _, value := range values {
+			// 检查完整的参数值
+			fullValue := key + "=" + value
+			if strings.Contains(strings.ToLower(fullValue), "drop table") {
+				return true
+			}
+
+			// 检查SQL注入模式
+			if g.matchPattern(value, sqlInjectionPatterns) {
+				return true
+			}
+
+			// 检查分号后的SQL命令
+			if strings.Contains(value, ";") {
+				// 处理形如 "id=1; DROP TABLE users" 的情况
+				if strings.Contains(strings.ToLower(value), "drop table") {
+					return true
+				}
+				// 处理其他SQL命令
+				parts := strings.Split(value, ";")
+				for _, part := range parts {
+					part = strings.TrimSpace(part)
+					if part == "" {
+						continue
+					}
+					// 检查DROP TABLE命令
+					if strings.Contains(strings.ToLower(part), "drop table") {
+						return true
+					}
+					// 检查其他SQL命令
+					if g.matchPattern(part, `(?i)\b(drop|delete|update|insert)\b`) {
+						return true
+					}
+				}
+			}
+			// 检查参数名
+			if g.matchPattern(key, `(?i)\b(drop|delete|update|insert)\b`) {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for key, values := range r.PostForm {
+				for _, value := range values {
+					// 检查完整的参数值
+					fullValue := key + "=" + value
+					if strings.Contains(strings.ToLower(fullValue), "drop table") {
+						return true
+					}
+
+					// 检查SQL注入模式
+					if g.matchPattern(value, sqlInjectionPatterns) {
+						return true
+					}
+
+					// 检查分号后的SQL命令
+					if strings.Contains(value, ";") {
+						// 处理形如 "id=1; DROP TABLE users" 的情况
+						if strings.Contains(strings.ToLower(value), "drop table") {
+							return true
+						}
+						// 处理其他SQL命令
+						parts := strings.Split(value, ";")
+						for _, part := range parts {
+							part = strings.TrimSpace(part)
+							if part == "" {
+								continue
+							}
+							// 检查DROP TABLE命令
+							if strings.Contains(strings.ToLower(part), "drop table") {
+								return true
+							}
+							// 检查其他SQL命令
+							if g.matchPattern(part, `(?i)\b(drop|delete|update|insert)\b`) {
+								return true
+							}
+						}
+					}
+					// 检查参数名
+					if g.matchPattern(key, `(?i)\b(drop|delete|update|insert)\b`) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// 检查原始查询字符串
+	rawQuery := r.URL.RawQuery
+	if strings.Contains(strings.ToLower(rawQuery), "drop table") {
+		return true
+	}
+
+	return false
+}
+
+// detectXSS 检测XSS攻击
+func (g *GFW) detectXSS(r *http.Request) bool {
+	// 检查URL参数
+	for _, values := range r.URL.Query() {
+		for _, value := range values {
+			if g.matchPattern(value, xssPatterns) {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for _, values := range r.PostForm {
+				for _, value := range values {
+					if g.matchPattern(value, xssPatterns) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// detectCSRF 检测CSRF攻击
+func (g *GFW) detectCSRF(r *http.Request) bool {
+	// 只检查POST请求
+	if r.Method != "POST" {
+		return false
+	}
+
+	// 检查Referer头
+	referer := r.Header.Get("Referer")
+	if referer == "" {
+		return true
+	}
+
+	// 检查Referer是否来自同一域名
+	refererURL, err := url.Parse(referer)
+	if err != nil {
+		return true
+	}
+
+	// 检查主机名是否匹配
+	if refererURL.Host != r.Host {
+		return true
+	}
+
+	return false
+}
+
+// detectSSRF 检测SSRF攻击
+func (g *GFW) detectSSRF(r *http.Request) bool {
+	// 检查URL参数
+	for _, values := range r.URL.Query() {
+		for _, value := range values {
+			if g.matchPattern(value, ssrfPatterns) {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for _, values := range r.PostForm {
+				for _, value := range values {
+					if g.matchPattern(value, ssrfPatterns) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// detectCommandInjection 检测命令注入攻击
+func (g *GFW) detectCommandInjection(r *http.Request) bool {
+	// 检查URL参数
+	for _, values := range r.URL.Query() {
+		for _, value := range values {
+			// 检查命令注入模式
+			if g.matchPattern(value, cmdInjectionPatterns) {
+				return true
+			}
+			// 检查管道符号
+			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+				return true
+			}
+			// 检查重定向符号
+			if strings.Contains(value, ">") || strings.Contains(value, "<") {
+				return true
+			}
+			// 检查敏感文件路径
+			if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
+				strings.Contains(value, "/etc/hosts") {
+				return true
+			}
+			// 检查系统命令
+			if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for _, values := range r.PostForm {
+				for _, value := range values {
+					// 检查命令注入模式
+					if g.matchPattern(value, cmdInjectionPatterns) {
+						return true
+					}
+					// 检查管道符号
+					if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+						return true
+					}
+					// 检查重定向符号
+					if strings.Contains(value, ">") || strings.Contains(value, "<") {
+						return true
+					}
+					// 检查敏感文件路径
+					if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
+						strings.Contains(value, "/etc/hosts") {
+						return true
+					}
+					// 检查系统命令
+					if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// 检查请求头
+	for _, header := range r.Header {
+		for _, value := range header {
+			// 检查命令注入模式
+			if g.matchPattern(value, cmdInjectionPatterns) {
+				return true
+			}
+			// 检查管道符号
+			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+				return true
+			}
+			// 检查重定向符号
+			if strings.Contains(value, ">") || strings.Contains(value, "<") {
+				return true
+			}
+			// 检查敏感文件路径
+			if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
+				strings.Contains(value, "/etc/hosts") {
+				return true
+			}
+			// 检查系统命令
+			if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// detectCodeInjection 检测代码注入攻击
+func (g *GFW) detectCodeInjection(r *http.Request) bool {
+	// 检查URL参数
+	for _, values := range r.URL.Query() {
+		for _, value := range values {
+			if g.matchPattern(value, codeInjectionPatterns) {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for _, values := range r.PostForm {
+				for _, value := range values {
+					if g.matchPattern(value, codeInjectionPatterns) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// detectFileInclude 检测文件包含漏洞
+func (g *GFW) detectFileInclude(r *http.Request) bool {
+	// 检查URL参数
+	for _, values := range r.URL.Query() {
+		for _, value := range values {
+			// 检查文件包含模式
+			if g.matchPattern(value, fileIncludePatterns) {
+				return true
+			}
+			// 检查PHP伪协议
+			if strings.Contains(value, "php://") || strings.Contains(value, "data://") ||
+				strings.Contains(value, "phar://") || strings.Contains(value, "zip://") {
+				return true
+			}
+			// 检查目录遍历
+			if strings.Contains(value, "../") || strings.Contains(value, "..\\") {
+				return true
+			}
+		}
+	}
+
+	// 检查POST数据
+	if r.Method == "POST" {
+		if err := r.ParseForm(); err == nil {
+			for _, values := range r.PostForm {
+				for _, value := range values {
+					// 检查文件包含模式
+					if g.matchPattern(value, fileIncludePatterns) {
+						return true
+					}
+					// 检查PHP伪协议
+					if strings.Contains(value, "php://") || strings.Contains(value, "data://") ||
+						strings.Contains(value, "phar://") || strings.Contains(value, "zip://") {
+						return true
+					}
+					// 检查目录遍历
+					if strings.Contains(value, "../") || strings.Contains(value, "..\\") {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// 检查请求头
+	for _, header := range r.Header {
+		for _, value := range header {
+			// 检查文件包含模式
+			if g.matchPattern(value, fileIncludePatterns) {
+				return true
+			}
+			// 检查PHP伪协议
+			if strings.Contains(value, "php://") || strings.Contains(value, "data://") ||
+				strings.Contains(value, "phar://") || strings.Contains(value, "zip://") {
+				return true
+			}
+			// 检查目录遍历
+			if strings.Contains(value, "../") || strings.Contains(value, "..\\") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// matchPattern 使用正则表达式匹配模式
+func (g *GFW) matchPattern(value, pattern string) bool {
+	matched, err := regexp.MatchString(pattern, value)
+	if err != nil {
+		g.logger.Error("正则表达式匹配失败",
+			zap.Error(err),
+			zap.String("pattern", pattern))
+		return false
+	}
+	return matched
 }
 
 // loadRulesFromFile 从文件中加载规则

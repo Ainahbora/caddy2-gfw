@@ -1,136 +1,151 @@
 # Caddy2-GFW
 
-Caddy2-GFW 是一个用于 Caddy 服务器的 HTTP 请求过滤模块，用于检测和拦截恶意请求。
+Caddy2-GFW 是一个基于 Caddy2 的 Web 应用防火墙模块，提供全面的安全防护功能。
 
-## 功能特点
+## 功能特性
 
-- 支持多种规则类型：
-  - IP地址/网段规则
-  - URL路径规则
-  - User-Agent规则
-- 规则文件自动刷新
-- 可配置的黑名单TTL
-- 自动清理过期黑名单
-- 支持规则文件注释
-- 线程安全的规则匹配
+### 基础功能
+- IP 黑名单管理
+- 规则文件监控和自动重载
+- 自定义 TTL 配置
+- 灵活的规则配置
+
+### 安全防护
+1. SQL 注入防护
+   - 检测 SQL 命令注入
+   - 检测 UNION 查询
+   - 检测 DROP/INSERT/UPDATE 等危险操作
+   - 检测布尔注入
+
+2. XSS 防护
+   - 检测 script 标签
+   - 检测 javascript: 协议
+   - 检测事件处理器
+   - 检测数据 URI
+
+3. CSRF 防护
+   - 检查 Referer 头
+   - 验证请求来源
+   - 支持自定义域名白名单
+
+4. SSRF 防护
+   - 检测本地 IP 访问
+   - 检测特殊协议
+   - 检测文件访问
+
+5. 命令注入防护
+   - 检测系统命令
+   - 检测管道操作
+   - 检测重定向操作
+   - 检测敏感文件访问
+
+6. 代码注入防护
+   - 检测危险函数调用
+   - 检测代码执行
+   - 检测文件包含
+
+7. 文件包含防护
+   - 检测目录遍历
+   - 检测 PHP 伪协议
+   - 检测远程文件包含
 
 ## 安装
 
 ```bash
-# 使用 xcaddy 构建
-xcaddy build --with github.com/ysicing/caddy2-gfw
+go install github.com/ysicing/caddy2-gfw@latest
 ```
 
 ## 配置示例
 
-### Caddyfile 配置
-
+### 基础配置
 ```caddyfile
-# 全局配置
 {
-    # 启用自动HTTPS
-    auto_https disable_redirects
-    # 设置日志级别
-    log {
-        level INFO
-    }
+    order gfw before respond
 }
 
-# 示例站点配置
 :80 {
-    # 启用GFW模块
     gfw {
-        # 规则文件路径
-        block_rule_file /etc/caddy/rules.txt
-        # 黑名单IP的TTL时间
-        ttl 24h
-        # 直接配置的规则（可选）
-        block_rule ip:192.168.1.1
+        block_rule ip:1.2.3.4
         block_rule url:/admin
         block_rule ua:curl
+        block_rule_file /path/to/rules.txt
+        ttl 24h
     }
-
-    # 反向代理配置
-    reverse_proxy localhost:8080
 }
 ```
 
 ### 规则文件格式
-
-规则文件支持以下格式：
-
-```text
-# IP规则
-ip:192.168.1.1
-ip:10.0.0.0/24
-
-# URL规则
+```
+# 注释行
+ip:1.2.3.4
 url:/admin
-url:/wp-login.php
-
-# User-Agent规则
 ua:curl
-ua:wget
 ```
 
-## 规则类型说明
+## 安全特性说明
 
-1. IP规则
-   - 支持单个IP地址：`ip:192.168.1.1`
-   - 支持CIDR格式：`ip:10.0.0.0/24`
+### SQL 注入防护
+- 检测常见的 SQL 注入模式
+- 支持检测分号后的 SQL 命令
+- 支持检测 UNION 查询
+- 支持检测布尔注入
 
-2. URL规则
-   - 支持路径匹配：`url:/admin`
-   - 支持文件匹配：`url:/wp-login.php`
+### XSS 防护
+- 检测 script 标签和事件处理器
+- 检测 javascript: 协议
+- 检测数据 URI
+- 检测表达式注入
 
-3. User-Agent规则
-   - 支持完整匹配：`ua:curl`
-   - 支持部分匹配：`ua:python-requests`
+### CSRF 防护
+- 验证请求来源
+- 检查 Referer 头
+- 支持自定义域名白名单
+- 支持 POST 请求验证
 
-## 配置选项
+### SSRF 防护
+- 检测本地 IP 访问
+- 检测特殊协议（file://, gopher://, dict://）
+- 检测文件访问
+- 支持自定义 IP 白名单
 
-- `block_rule_file`: 规则文件路径
-- `ttl`: 黑名单IP的TTL时间，默认为24小时
-- `block_rule`: 直接在配置中添加规则
+### 命令注入防护
+- 检测系统命令（cat, ls, rm 等）
+- 检测管道操作（|, &, ;）
+- 检测重定向操作（>, <）
+- 检测敏感文件访问
 
-## 日志说明
+### 代码注入防护
+- 检测危险函数调用
+- 检测代码执行
+- 检测文件包含
+- 支持自定义函数黑名单
 
-模块会记录以下类型的日志：
-
-1. 初始化日志
-   - 规则文件加载状态
-   - 配置参数信息
-
-2. 请求处理日志
-   - 黑名单IP拦截
-   - 规则匹配拦截
-   - 恶意请求检测
-
-3. 维护日志
-   - 规则文件更新
-   - 黑名单清理
+### 文件包含防护
+- 检测目录遍历（../）
+- 检测 PHP 伪协议
+- 检测远程文件包含
+- 支持自定义路径白名单
 
 ## 注意事项
 
-1. 规则文件格式
-   - 每行一条规则
-   - 支持#开头的注释行
-   - 支持空行
-   - 规则格式必须正确
+1. 性能考虑
+   - 规则文件不要过大
+   - 定期清理过期黑名单
+   - 合理设置 TTL
 
-2. 性能考虑
-   - 规则文件不宜过大
-   - 建议定期清理过期规则
-   - 合理设置TTL时间
+2. 安全建议
+   - 定期更新规则
+   - 监控攻击日志
+   - 及时处理异常
 
-3. 安全建议
-   - 定期更新规则文件
-   - 监控日志文件
-   - 及时处理异常请求
+3. 配置建议
+   - 根据实际需求配置规则
+   - 合理设置 TTL
+   - 定期检查规则文件
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 和 Pull Request。
 
 ## 许可证
 

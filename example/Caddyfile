@@ -1,17 +1,58 @@
+{
+    # 全局配置
+    order gfw before respond
+    
+    # 日志配置
+    log {
+        level INFO
+    }
+}
+
 # 示例站点配置
 :80 {
     # 启用GFW模块
     gfw {
         # 规则文件路径
-        block_rule_file ./rules.txt
+        block_rule_file /etc/caddy/rules.txt
+        
         # 黑名单IP的TTL时间
         ttl 24h
-        # 直接配置的规则（可选）
+        
+        # 直接配置的规则
         block_rule ip:192.168.1.1
         block_rule url:/admin
         block_rule ua:curl
     }
-    respond "Hello, 80 port"
+
+    # 反向代理配置
+    reverse_proxy localhost:8080
+}
+
+# 安全防护示例
+:443 {
+    # 启用GFW模块
+    gfw {
+        # 规则文件路径
+        block_rule_file /etc/caddy/security_rules.txt
+        
+        # 黑名单IP的TTL时间
+        ttl 12h
+        
+        # 安全规则
+        block_rule ip:10.0.0.0/24
+        block_rule url:/wp-login.php
+        block_rule url:/phpmyadmin
+        block_rule ua:sqlmap
+        block_rule ua:nmap
+    }
+
+    # TLS配置
+    tls {
+        protocols tls1.2 tls1.3
+    }
+
+    # 反向代理配置
+    reverse_proxy localhost:8443
 }
 
 # HTTPS站点配置

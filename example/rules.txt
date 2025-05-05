@@ -14,16 +14,23 @@ url:/admin
 url:/wp-login.php
 url:/wp-admin
 url:/phpmyadmin
+url:/wp-content
+url:/wp-includes
 url:/.env
 url:/config.php
 url:/install.php
 url:/setup.php
 url:/shell.php
 url:/backup.sql
+url:/.git
+url:/.svn
+url:/wp-config.php
 
 # User-Agent规则
 ua:curl
 ua:wget
+ua:sqlmap
+ua:nmap
 ua:python-requests
 ua:python-urllib
 ua:go-http-client
@@ -32,10 +39,12 @@ ua:apache-httpclient
 ua:okhttp
 ua:postman
 ua:insomnia
+ua:dirbuster
+ua:gobuster
+ua:ffuf
+ua:feroxbuster
 
 # 常见扫描器
-ua:sqlmap
-ua:nmap
 ua:nikto
 ua:acunetix
 ua:burp
@@ -43,4 +52,9 @@ ua:zap
 ua:nessus
 ua:openvas
 ua:metasploit
-ua:hydra 
+ua:hydra
+
+# 禁止常见攻击IP
+ip:1.2.3.4
+ip:5.6.7.8
+ip:9.10.11.12 
