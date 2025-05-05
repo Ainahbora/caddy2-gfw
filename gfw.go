@@ -2,6 +2,7 @@ package gfw
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ysicing/caddy2-gfw/storage"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -62,6 +65,48 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("gfw", parseCaddyfile)
 }
 
+// Storage 定义存储接口
+type Storage interface {
+	Load(key string) ([]byte, error)
+	Store(key string, data []byte) error
+}
+
+// FileStorage 实现基于文件的存储
+type FileStorage struct {
+	baseDir string
+}
+
+// NewFileStorage 创建新的文件存储实例
+func NewFileStorage(baseDir string) (*FileStorage, error) {
+	// 确保目录存在
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create storage directory: %w", err)
+	}
+	return &FileStorage{baseDir: baseDir}, nil
+}
+
+// Load 从文件加载数据
+func (fs *FileStorage) Load(key string) ([]byte, error) {
+	path := filepath.Join(fs.baseDir, key)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	return data, nil
+}
+
+// Store 将数据存储到文件
+func (fs *FileStorage) Store(key string, data []byte) error {
+	path := filepath.Join(fs.baseDir, key)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	return nil
+}
+
 // GFW 实现了一个Caddy HTTP处理器，用于检测恶意请求
 type GFW struct {
 	// 配置选项
@@ -81,6 +126,7 @@ type GFW struct {
 	maxConcurrent    int
 	semaphore        chan struct{}
 	watcher          *fsnotify.Watcher
+	storage          storage.Storage
 }
 
 // RuleCache 规则缓存
@@ -178,13 +224,26 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 		g.TTL = defaultBlacklistTTL
 	}
 
+	// 初始化存储
+	storageDir := filepath.Join(caddy.AppDataDir(), "gfw")
+	storage, err := storage.NewFileStorage(storageDir)
+	if err != nil {
+		return fmt.Errorf("failed to initialize storage: %w", err)
+	}
+	g.storage = storage
+
+	// 从存储加载黑名单
+	if err := g.loadBlacklist(); err != nil {
+		g.logger.Error("failed to load blacklist", zap.Error(err))
+	}
+
 	// 初始化规则缓存
 	g.ruleCache = NewRuleCache()
 
 	// 如果指定了规则文件，从文件中读取规则
 	if g.BlockRuleFile != "" {
 		if err := g.loadRulesFromFile(); err != nil {
-			g.logger.Error("从文件加载规则失败",
+			g.logger.Error("failed to load rules from file",
 				zap.Error(err),
 				zap.String("file", g.BlockRuleFile))
 		}
@@ -195,7 +254,7 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	// 启动黑名单清理协程
 	go g.cleanupBlacklist()
 
-	g.logger.Info("GFW模块已初始化",
+	g.logger.Info("GFW module initialized",
 		zap.String("block_rule_file", g.BlockRuleFile),
 		zap.Strings("block_rules", g.BlockRules),
 		zap.Duration("ttl", g.TTL))
@@ -209,7 +268,7 @@ func (g *GFW) Cleanup() error {
 	<-g.done // 等待清理协程完成
 	if g.watcher != nil {
 		if err := g.watcher.Close(); err != nil {
-			g.logger.Error("关闭文件监控失败", zap.Error(err))
+			g.logger.Error("failed to close file watcher", zap.Error(err))
 		}
 	}
 	return nil
@@ -256,10 +315,17 @@ func (g *GFW) cleanup() {
 	}
 
 	if expiredCount > 0 {
-		g.logger.Debug("清理过期黑名单记录",
+		g.logger.Debug("cleaned up expired blacklist entries",
 			zap.Int("expired_count", expiredCount),
 			zap.Int("remaining_count", len(g.blackList)),
 			zap.Strings("expired_ips", expiredIPs))
+
+		// 异步保存更新后的黑名单
+		go func() {
+			if err := g.saveBlacklist(); err != nil {
+				g.logger.Error("failed to save blacklist", zap.Error(err))
+			}
+		}()
 	}
 }
 
@@ -284,7 +350,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	// 检查IP是否在黑名单中
 	if g.isIPBlacklisted(clientIP) {
-		g.logger.Info("拦截黑名单IP的请求",
+		g.logger.Info("blocked request due to blacklisted IP",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path))
 		http.Error(w, "blocked by gfw", http.StatusForbidden)
@@ -296,7 +362,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		// 将IP加入黑名单
 		g.addToBlacklist(clientIP)
 
-		g.logger.Warn("检测到恶意请求",
+		g.logger.Warn("detected malicious request",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path),
 			zap.String("user_agent", r.UserAgent()))
@@ -335,6 +401,13 @@ func (g *GFW) addToBlacklist(ip string) {
 	}
 
 	g.blackList[ip] = time.Now().Add(g.TTL)
+
+	// 异步保存黑名单
+	go func() {
+		if err := g.saveBlacklist(); err != nil {
+			g.logger.Error("failed to save blacklist", zap.Error(err))
+		}
+	}()
 }
 
 // cleanupOldest 清理最旧的黑名单记录
@@ -366,60 +439,60 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 	// 使用规则缓存进行匹配
 	if g.ruleCache != nil {
 		if g.ruleCache.MatchIP(clientIP) {
-			g.logger.Info("IP规则匹配", zap.String("client_ip", clientIP))
+			g.logger.Info("IP rule matched", zap.String("client_ip", clientIP))
 			return false
 		}
 
 		if g.ruleCache.MatchURL(requestPath) {
-			g.logger.Info("URL路径规则匹配", zap.String("path", requestPath))
+			g.logger.Info("URL path rule matched", zap.String("path", requestPath))
 			return false
 		}
 
 		if g.ruleCache.MatchUserAgent(userAgent) {
-			g.logger.Info("User-Agent规则匹配", zap.String("user_agent", userAgent))
+			g.logger.Info("User-Agent rule matched", zap.String("user_agent", userAgent))
 			return false
 		}
 	}
 
 	// 检查SQL注入
 	if g.detectSQLInjection(r) {
-		g.logger.Warn("检测到SQL注入攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected SQL injection attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查XSS攻击
 	if g.detectXSS(r) {
-		g.logger.Warn("检测到XSS攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected XSS attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查CSRF攻击
 	if g.detectCSRF(r) {
-		g.logger.Warn("检测到CSRF攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected CSRF attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查SSRF攻击
 	if g.detectSSRF(r) {
-		g.logger.Warn("检测到SSRF攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected SSRF attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查命令注入
 	if g.detectCommandInjection(r) {
-		g.logger.Warn("检测到命令注入攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected command injection attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查代码注入
 	if g.detectCodeInjection(r) {
-		g.logger.Warn("检测到代码注入攻击", zap.String("ip", clientIP))
+		g.logger.Warn("detected code injection attack", zap.String("ip", clientIP))
 		return false
 	}
 
 	// 检查文件包含漏洞
 	if g.detectFileInclude(r) {
-		g.logger.Warn("检测到文件包含漏洞", zap.String("ip", clientIP))
+		g.logger.Warn("detected file inclusion vulnerability", zap.String("ip", clientIP))
 		return false
 	}
 
@@ -816,7 +889,7 @@ func (g *GFW) detectFileInclude(r *http.Request) bool {
 func (g *GFW) watchRuleFile() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		g.logger.Error("创建文件监控失败", zap.Error(err))
+		g.logger.Error("failed to create file watcher", zap.Error(err))
 		return
 	}
 	g.watcher = watcher
@@ -827,7 +900,7 @@ func (g *GFW) watchRuleFile() {
 
 	// 监控目录而不是单个文件
 	if err := watcher.Add(ruleDir); err != nil {
-		g.logger.Error("添加目录监控失败",
+		g.logger.Error("failed to add directory to watcher",
 			zap.Error(err),
 			zap.String("directory", ruleDir))
 		return
@@ -845,7 +918,7 @@ func (g *GFW) watchRuleFile() {
 						// 添加延迟，等待文件写入完成
 						time.Sleep(100 * time.Millisecond)
 						if err := g.loadRulesFromFile(); err != nil {
-							g.logger.Error("重新加载规则失败",
+							g.logger.Error("failed to reload rules",
 								zap.Error(err),
 								zap.String("file", g.BlockRuleFile))
 						}
@@ -853,7 +926,7 @@ func (g *GFW) watchRuleFile() {
 						// 文件被删除，尝试重新添加监控
 						time.Sleep(100 * time.Millisecond)
 						if err := watcher.Add(ruleDir); err != nil {
-							g.logger.Error("重新添加目录监控失败",
+							g.logger.Error("failed to re-add directory to watcher",
 								zap.Error(err),
 								zap.String("directory", ruleDir))
 						}
@@ -861,13 +934,13 @@ func (g *GFW) watchRuleFile() {
 				}
 			case err := <-watcher.Errors:
 				if err != nil {
-					g.logger.Error("文件监控错误",
+					g.logger.Error("file watcher error",
 						zap.Error(err),
 						zap.String("directory", ruleDir))
 					// 尝试重新添加监控
 					time.Sleep(1 * time.Second)
 					if err := watcher.Add(ruleDir); err != nil {
-						g.logger.Error("重新添加目录监控失败",
+						g.logger.Error("failed to re-add directory to watcher",
 							zap.Error(err),
 							zap.String("directory", ruleDir))
 					}
@@ -878,7 +951,7 @@ func (g *GFW) watchRuleFile() {
 		}
 	}()
 
-	g.logger.Info("文件监控已启动",
+	g.logger.Info("file watcher started",
 		zap.String("directory", ruleDir),
 		zap.String("file", ruleFile))
 }
@@ -888,7 +961,7 @@ func (g *GFW) loadRulesFromFile() error {
 	// 获取文件信息
 	fileInfo, err := os.Stat(g.BlockRuleFile)
 	if err != nil {
-		return fmt.Errorf("获取规则文件信息失败: %w", err)
+		return fmt.Errorf("failed to get rule file info: %w", err)
 	}
 
 	// 更新最后修改时间
@@ -897,7 +970,7 @@ func (g *GFW) loadRulesFromFile() error {
 	// 打开规则文件
 	file, err := os.Open(g.BlockRuleFile)
 	if err != nil {
-		return fmt.Errorf("打开规则文件失败: %w", err)
+		return fmt.Errorf("failed to open rule file: %w", err)
 	}
 	defer file.Close()
 
@@ -925,7 +998,7 @@ func (g *GFW) loadRulesFromFile() error {
 
 	// 检查是否有扫描错误
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("读取规则文件失败: %w", err)
+		return fmt.Errorf("failed to read rule file: %w", err)
 	}
 
 	// 更新规则缓存
@@ -937,7 +1010,7 @@ func (g *GFW) loadRulesFromFile() error {
 		g.BlockRules = append(g.BlockRules, rule)
 	}
 
-	g.logger.Info("从文件加载规则成功",
+	g.logger.Info("rules loaded from file",
 		zap.String("file", g.BlockRuleFile),
 		zap.Int("total_lines", lineCount),
 		zap.Int("rules_loaded", ruleCount),
@@ -1025,5 +1098,66 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 		}
 	}
+	return nil
+}
+
+// loadBlacklist 从存储加载黑名单
+func (g *GFW) loadBlacklist() error {
+	data, err := g.storage.Load("blacklist.json")
+	if err != nil {
+		return fmt.Errorf("failed to read blacklist: %w", err)
+	}
+
+	if len(data) == 0 {
+		return nil
+	}
+
+	var blacklist map[string]string
+	if err := json.Unmarshal(data, &blacklist); err != nil {
+		return fmt.Errorf("failed to parse blacklist: %w", err)
+	}
+
+	g.blackListMu.Lock()
+	defer g.blackListMu.Unlock()
+
+	now := time.Now()
+	for ip, expireStr := range blacklist {
+		expireTime, err := time.Parse(time.RFC3339, expireStr)
+		if err != nil {
+			g.logger.Warn("failed to parse expiration time",
+				zap.Error(err),
+				zap.String("ip", ip),
+				zap.String("expire_time", expireStr))
+			continue
+		}
+
+		// 只加载未过期的记录
+		if now.Before(expireTime) {
+			g.blackList[ip] = expireTime
+		}
+	}
+
+	return nil
+}
+
+// saveBlacklist 保存黑名单到存储
+func (g *GFW) saveBlacklist() error {
+	g.blackListMu.RLock()
+	defer g.blackListMu.RUnlock()
+
+	blacklist := make(map[string]string)
+	for ip, expireTime := range g.blackList {
+		blacklist[ip] = expireTime.Format(time.RFC3339)
+	}
+
+	data, err := json.Marshal(blacklist)
+	if err != nil {
+		return fmt.Errorf("failed to serialize blacklist: %w", err)
+	}
+
+	if err := g.storage.Store("blacklist.json", data); err != nil {
+		return fmt.Errorf("failed to save blacklist: %w", err)
+	}
+
 	return nil
 }
