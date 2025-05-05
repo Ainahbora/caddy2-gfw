@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,54 +66,13 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("gfw", parseCaddyfile)
 }
 
-// Storage 定义存储接口
-type Storage interface {
-	Load(key string) ([]byte, error)
-	Store(key string, data []byte) error
-}
-
-// FileStorage 实现基于文件的存储
-type FileStorage struct {
-	baseDir string
-}
-
-// NewFileStorage 创建新的文件存储实例
-func NewFileStorage(baseDir string) (*FileStorage, error) {
-	// 确保目录存在
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create storage directory: %w", err)
-	}
-	return &FileStorage{baseDir: baseDir}, nil
-}
-
-// Load 从文件加载数据
-func (fs *FileStorage) Load(key string) ([]byte, error) {
-	path := filepath.Join(fs.baseDir, key)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-	return data, nil
-}
-
-// Store 将数据存储到文件
-func (fs *FileStorage) Store(key string, data []byte) error {
-	path := filepath.Join(fs.baseDir, key)
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-	return nil
-}
-
 // GFW 实现了一个Caddy HTTP处理器，用于检测恶意请求
 type GFW struct {
 	// 配置选项
 	BlockRules    []string      `json:"block_rules,omitempty"`
 	BlockRuleFile string        `json:"block_rule_file,omitempty"`
 	TTL           time.Duration `json:"ttl,omitempty"`
+	EnableExtra   bool          `json:"enable_extra,omitempty"` // 是否启用额外安全检测
 
 	// 内部状态
 	blackList        map[string]time.Time
@@ -436,7 +396,7 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 	requestPath := r.URL.Path
 	clientIP := r.RemoteAddr
 
-	// 使用规则缓存进行匹配
+	// 使用规则缓存进行匹配（基本安全检测）
 	if g.ruleCache != nil {
 		if g.ruleCache.MatchIP(clientIP) {
 			g.logger.Info("IP rule matched", zap.String("client_ip", clientIP))
@@ -452,6 +412,11 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 			g.logger.Info("User-Agent rule matched", zap.String("user_agent", userAgent))
 			return false
 		}
+	}
+
+	// 如果额外安全检测被禁用，直接返回true
+	if !g.EnableExtra {
+		return true
 	}
 
 	// 检查SQL注入
@@ -669,6 +634,11 @@ func (g *GFW) detectCSRF(r *http.Request) bool {
 
 	// 检查主机名是否匹配
 	if refererURL.Host != r.Host {
+		return true
+	}
+
+	// 检查CSRF token
+	if csrfRegex.MatchString(referer) {
 		return true
 	}
 
@@ -1022,6 +992,7 @@ func (g *GFW) loadRulesFromFile() error {
 // parseCaddyfile 解析Caddyfile配置
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var g GFW
+	g.EnableExtra = false // 默认禁用额外安全检测
 
 	for h.Next() {
 		// 解析配置参数
@@ -1049,6 +1020,16 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.TTL = duration
 
+			case "enable_extra":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				enable, err := strconv.ParseBool(h.Val())
+				if err != nil {
+					return nil, h.Errf("invalid enable_extra value: %v", err)
+				}
+				g.EnableExtra = enable
+
 			default:
 				return nil, h.Errf("unknown subdirective '%s'", h.Val())
 			}
@@ -1058,16 +1039,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return &g, nil
 }
 
-// Interface guards
-var (
-	_ caddy.Provisioner           = (*GFW)(nil)
-	_ caddy.Validator             = (*GFW)(nil)
-	_ caddyhttp.MiddlewareHandler = (*GFW)(nil)
-	_ caddyfile.Unmarshaler       = (*GFW)(nil)
-)
-
 // UnmarshalCaddyfile 实现 caddyfile.Unmarshaler
 func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	g.EnableExtra = false // 默认禁用额外安全检测
+
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
@@ -1092,6 +1067,16 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid ttl duration: %v", err)
 				}
 				g.TTL = duration
+
+			case "enable_extra":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				enable, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					return d.Errf("invalid enable_extra value: %v", err)
+				}
+				g.EnableExtra = enable
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
@@ -1161,3 +1146,11 @@ func (g *GFW) saveBlacklist() error {
 
 	return nil
 }
+
+// Interface guards
+var (
+	_ caddy.Provisioner           = (*GFW)(nil)
+	_ caddy.Validator             = (*GFW)(nil)
+	_ caddyhttp.MiddlewareHandler = (*GFW)(nil)
+	_ caddyfile.Unmarshaler       = (*GFW)(nil)
+)
