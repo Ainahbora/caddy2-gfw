@@ -22,6 +22,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/fsnotify/fsnotify"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/zap"
 )
 
@@ -61,6 +63,26 @@ var (
 	ErrRuleFileReadError = errors.New("failed to read rule file")
 )
 
+// 定义严重攻击类型
+var (
+	severeAttackTypes = map[string]bool{
+		"sql_injection":     true,
+		"command_injection": true,
+		"code_injection":    true,
+		"ssrf":              true,
+	}
+)
+
+// 全局 metrics 变量和 once
+var (
+	metricsOnce      sync.Once
+	requestsTotal    *prometheus.CounterVec
+	attackDetections *prometheus.CounterVec
+	blacklistSize    prometheus.Gauge
+	ruleMatches      *prometheus.CounterVec
+	requestDuration  prometheus.Histogram
+)
+
 func init() {
 	caddy.RegisterModule(&GFW{})
 	httpcaddyfile.RegisterHandlerDirective("gfw", parseCaddyfile)
@@ -73,6 +95,7 @@ type GFW struct {
 	BlockRuleFile string        `json:"block_rule_file,omitempty"`
 	TTL           time.Duration `json:"ttl,omitempty"`
 	EnableExtra   bool          `json:"enable_extra,omitempty"` // 是否启用额外安全检测
+	BlockAll      bool          `json:"block_all,omitempty"`    // 规则匹配时是否拦截所有请求
 
 	// 内部状态
 	blackList        map[string]time.Time
@@ -184,6 +207,43 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 		g.TTL = defaultBlacklistTTL
 	}
 
+	// 全局只注册一次 metrics
+	metricsOnce.Do(func() {
+		registry := ctx.GetMetricsRegistry()
+		const ns, sub = "caddy", "gfw"
+		requestsTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "requests_total",
+			Help:      "Total number of requests processed by GFW",
+		}, []string{"status"})
+		attackDetections = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "attack_detections_total",
+			Help:      "Total number of detected attacks by GFW",
+		}, []string{"type"})
+		blacklistSize = promauto.With(registry).NewGauge(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "blacklist_size",
+			Help:      "Current number of IPs in GFW blacklist",
+		})
+		ruleMatches = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "rule_matches_total",
+			Help:      "Total number of rule matches by GFW",
+		}, []string{"type"})
+		requestDuration = promauto.With(registry).NewHistogram(prometheus.HistogramOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "request_duration_seconds",
+			Help:      "Request processing duration by GFW in seconds",
+			Buckets:   prometheus.DefBuckets,
+		})
+	})
+
 	// 初始化存储
 	storageDir := filepath.Join(caddy.AppDataDir(), "gfw")
 	storage, err := storage.NewFileStorage(storageDir)
@@ -274,6 +334,9 @@ func (g *GFW) cleanup() {
 		delete(g.blackList, ip)
 	}
 
+	// 更新黑名单大小指标
+	blacklistSize.Set(float64(len(g.blackList)))
+
 	if expiredCount > 0 {
 		g.logger.Debug("cleaned up expired blacklist entries",
 			zap.Int("expired_count", expiredCount),
@@ -296,11 +359,19 @@ func (g *GFW) Validate() error {
 
 // ServeHTTP 实现caddyhttp.MiddlewareHandler接口，处理HTTP请求
 func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// 记录请求开始时间
+	start := time.Now()
+	defer func() {
+		// 记录请求处理时间
+		requestDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	// 并发限制
 	select {
 	case g.semaphore <- struct{}{}:
 		defer func() { <-g.semaphore }()
 	default:
+		requestsTotal.WithLabelValues("too_many_requests").Inc()
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return nil
 	}
@@ -310,6 +381,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	// 检查IP是否在黑名单中
 	if g.isIPBlacklisted(clientIP) {
+		requestsTotal.WithLabelValues("blacklisted").Inc()
 		g.logger.Info("blocked request due to blacklisted IP",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path))
@@ -318,14 +390,29 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 
 	// 检查请求是否合法
-	if !g.isRequestLegal(r) {
-		// 将IP加入黑名单
-		g.addToBlacklist(clientIP)
+	attackType, isLegal := g.isRequestLegal(r)
+	if !isLegal {
+		// 如果是规则匹配且配置为拦截所有请求，将IP加入黑名单
+		if strings.HasSuffix(attackType, "_rule") && g.BlockAll {
+			g.addToBlacklist(clientIP)
+			g.logger.Warn("rule matched, IP added to blacklist",
+				zap.String("ip", clientIP),
+				zap.String("rule_type", attackType))
+		}
+		// 如果是额外安全检测，将IP加入黑名单
+		if !strings.HasSuffix(attackType, "_rule") {
+			g.addToBlacklist(clientIP)
+			g.logger.Warn("detected attack, IP added to blacklist",
+				zap.String("ip", clientIP),
+				zap.String("attack_type", attackType))
+		}
 
+		requestsTotal.WithLabelValues("blocked").Inc()
 		g.logger.Warn("detected malicious request",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path),
-			zap.String("user_agent", r.UserAgent()))
+			zap.String("user_agent", r.UserAgent()),
+			zap.String("attack_type", attackType))
 
 		// 返回403状态码
 		http.Error(w, "blocked by gfw", http.StatusForbidden)
@@ -333,6 +420,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 
 	// 请求合法，继续处理
+	requestsTotal.WithLabelValues("allowed").Inc()
 	return next.ServeHTTP(w, r)
 }
 
@@ -389,8 +477,8 @@ func (g *GFW) cleanupOldest() {
 	}
 }
 
-// isRequestLegal 检查请求是否合法
-func (g *GFW) isRequestLegal(r *http.Request) bool {
+// isRequestLegal 检查请求是否合法，返回攻击类型和是否合法
+func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 	// 获取请求信息
 	userAgent := r.UserAgent()
 	requestPath := r.URL.Path
@@ -399,66 +487,76 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 	// 使用规则缓存进行匹配（基本安全检测）
 	if g.ruleCache != nil {
 		if g.ruleCache.MatchIP(clientIP) {
+			ruleMatches.WithLabelValues("ip").Inc()
 			g.logger.Info("IP rule matched", zap.String("client_ip", clientIP))
-			return false
+			return "ip_rule", false
 		}
 
 		if g.ruleCache.MatchURL(requestPath) {
+			ruleMatches.WithLabelValues("url").Inc()
 			g.logger.Info("URL path rule matched", zap.String("path", requestPath))
-			return false
+			return "url_rule", false
 		}
 
 		if g.ruleCache.MatchUserAgent(userAgent) {
+			ruleMatches.WithLabelValues("ua").Inc()
 			g.logger.Info("User-Agent rule matched", zap.String("user_agent", userAgent))
-			return false
+			return "ua_rule", false
 		}
 	}
 
 	// 如果额外安全检测被禁用，直接返回true
 	if !g.EnableExtra {
-		return true
+		return "", true
 	}
 
 	// 检查SQL注入
 	if g.detectSQLInjection(r) {
+		attackDetections.WithLabelValues("sql_injection").Inc()
 		g.logger.Warn("detected SQL injection attack", zap.String("ip", clientIP))
-		return false
+		return "sql_injection", false
 	}
 
 	// 检查XSS攻击
 	if g.detectXSS(r) {
+		attackDetections.WithLabelValues("xss").Inc()
 		g.logger.Warn("detected XSS attack", zap.String("ip", clientIP))
-		return false
+		return "xss", false
 	}
 
 	// 检查CSRF攻击
 	if g.detectCSRF(r) {
+		attackDetections.WithLabelValues("csrf").Inc()
 		g.logger.Warn("detected CSRF attack", zap.String("ip", clientIP))
-		return false
+		return "csrf", false
 	}
 
 	// 检查SSRF攻击
 	if g.detectSSRF(r) {
+		attackDetections.WithLabelValues("ssrf").Inc()
 		g.logger.Warn("detected SSRF attack", zap.String("ip", clientIP))
-		return false
+		return "ssrf", false
 	}
 
 	// 检查命令注入
 	if g.detectCommandInjection(r) {
+		attackDetections.WithLabelValues("command_injection").Inc()
 		g.logger.Warn("detected command injection attack", zap.String("ip", clientIP))
-		return false
+		return "command_injection", false
 	}
 
 	// 检查代码注入
 	if g.detectCodeInjection(r) {
+		attackDetections.WithLabelValues("code_injection").Inc()
 		g.logger.Warn("detected code injection attack", zap.String("ip", clientIP))
-		return false
+		return "code_injection", false
 	}
 
 	// 检查文件包含漏洞
 	if g.detectFileInclude(r) {
+		attackDetections.WithLabelValues("file_include").Inc()
 		g.logger.Warn("detected file inclusion vulnerability", zap.String("ip", clientIP))
-		return false
+		return "file_include", false
 	}
 
 	// 检查是否直接使用IP访问80或443端口（没有配置域名）
@@ -474,11 +572,12 @@ func (g *GFW) isRequestLegal(r *http.Request) bool {
 
 	// 如果是直接使用IP访问，则认为请求不合法
 	if isIP {
-		return false
+		attackDetections.WithLabelValues("direct_ip_access").Inc()
+		return "direct_ip_access", false
 	}
 
 	// 默认认为请求合法
-	return true
+	return "", true
 }
 
 // detectSQLInjection 检测SQL注入攻击
@@ -993,6 +1092,7 @@ func (g *GFW) loadRulesFromFile() error {
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var g GFW
 	g.EnableExtra = false // 默认禁用额外安全检测
+	g.BlockAll = false    // 默认只拦截单次请求
 
 	for h.Next() {
 		// 解析配置参数
@@ -1030,6 +1130,16 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.EnableExtra = enable
 
+			case "block_all":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				blockAll, err := strconv.ParseBool(h.Val())
+				if err != nil {
+					return nil, h.Errf("invalid block_all value: %v", err)
+				}
+				g.BlockAll = blockAll
+
 			default:
 				return nil, h.Errf("unknown subdirective '%s'", h.Val())
 			}
@@ -1042,6 +1152,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 // UnmarshalCaddyfile 实现 caddyfile.Unmarshaler
 func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	g.EnableExtra = false // 默认禁用额外安全检测
+	g.BlockAll = false    // 默认只拦截单次请求
 
 	for d.Next() {
 		for d.NextBlock(0) {
@@ -1077,6 +1188,16 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid enable_extra value: %v", err)
 				}
 				g.EnableExtra = enable
+
+			case "block_all":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				blockAll, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					return d.Errf("invalid block_all value: %v", err)
+				}
+				g.BlockAll = blockAll
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())

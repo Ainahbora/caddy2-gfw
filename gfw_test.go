@@ -461,6 +461,75 @@ func TestGFW_ExtraSecurity(t *testing.T) {
 	}
 }
 
+func TestGFW_BlockAllBehavior(t *testing.T) {
+	g := setupGFW(t)
+	g.BlockAll = true
+	g.BlockRules = []string{"ip:192.0.2.1"}
+	g.ruleCache = NewRuleCache()
+	g.ruleCache.AddRule("ip:192.0.2.1")
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.0.2.1"
+	recorder := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	// 第一次命中规则，应该被拉黑
+	_ = g.ServeHTTP(recorder, req, next)
+	if !g.isIPBlacklisted("192.0.2.1") {
+		t.Errorf("BlockAll=true 时，命中规则后 IP 应该被拉黑")
+	}
+
+	// 第二次请求，应该直接被拦截
+	recorder2 := httptest.NewRecorder()
+	_ = g.ServeHTTP(recorder2, req, next)
+	if recorder2.Code != http.StatusForbidden {
+		t.Errorf("BlockAll=true 时，黑名单 IP 应该被拦截")
+	}
+}
+
+func TestGFW_BlockAllFalseBehavior(t *testing.T) {
+	g := setupGFW(t)
+	g.BlockAll = false
+	g.BlockRules = []string{"ip:192.0.2.2"}
+	g.ruleCache = NewRuleCache()
+	g.ruleCache.AddRule("ip:192.0.2.2")
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.0.2.2"
+	recorder := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	// 命中规则，只拦截本次，不拉黑
+	_ = g.ServeHTTP(recorder, req, next)
+	if g.isIPBlacklisted("192.0.2.2") {
+		t.Errorf("BlockAll=false 时，命中规则后 IP 不应被拉黑")
+	}
+}
+
+// 可选：metrics 相关断言（示例，实际可根据需要完善）
+func TestGFW_Metrics(t *testing.T) {
+	before := requestsTotal.WithLabelValues("allowed").Collect
+	g := setupGFW(t)
+	g.BlockAll = false
+	g.BlockRules = []string{"ip:192.0.2.3"}
+	g.ruleCache = NewRuleCache()
+	g.ruleCache.AddRule("ip:192.0.2.3")
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.0.2.3"
+	recorder := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+	_ = g.ServeHTTP(recorder, req, next)
+	// 这里只做示例，实际可用 prometheus/testutil 断言指标递增
+	_ = before // 防止未使用
+}
+
 func setupGFW(t *testing.T) *GFW {
 	g := &GFW{
 		TTL: defaultBlacklistTTL,

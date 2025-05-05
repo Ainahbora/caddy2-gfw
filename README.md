@@ -168,3 +168,36 @@ ua:curl
 ## 许可证
 
 MIT License
+
+## Metrics 指标
+
+本模块支持 Prometheus 监控，自动集成到 Caddy 的 `/metrics` 端点。主要指标如下：
+
+- `caddy_gfw_requests_total{status}`：请求总数（按 allowed/blocked/blacklisted/too_many_requests 分类）
+- `caddy_gfw_attack_detections_total{type}`：各类攻击检测次数
+- `caddy_gfw_blacklist_size`：当前黑名单 IP 数量
+- `caddy_gfw_rule_matches_total{type}`：规则命中次数
+- `caddy_gfw_request_duration_seconds`：请求处理耗时直方图
+
+**如何启用：**
+Caddyfile 增加
+```
+:9180 {
+    metrics
+}
+```
+即可通过 `http://localhost:9180/metrics` 采集。
+
+## 配置项说明
+
+- `block_all`：控制规则命中时是否将 IP 加入黑名单，
+  - `true`：规则命中后，IP 被拉黑，后续请求全部拦截。
+  - `false`（默认）：规则命中只拦截本次请求，不拉黑 IP。
+
+**示例：**
+```
+gfw {
+    block_rule ip:1.2.3.4
+    block_all true
+}
+```

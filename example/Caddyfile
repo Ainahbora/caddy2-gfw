@@ -25,7 +25,7 @@
 	}
 
 	# 反向代理配置
-	reverse_proxy localhost:8080
+	respond "Hello 80"
 }
 
 # 安全防护示例
@@ -52,7 +52,11 @@
 	}
 
 	# 反向代理配置
-	reverse_proxy localhost:8443
+	respond "Hello 443"
+}
+
+:9180 {
+	metrics
 }
 
 # HTTPS站点配置
@@ -60,6 +64,7 @@ http://127.0.0.1.sslip.io:80 {
 	# 启用GFW模块
 	gfw {
 		block_rule_file ./rules.txt
+		block_all true # 规则匹配时是否拦截所有请求
 		ttl 24h
 		# 启用额外安全检测
 		enable_extra true
