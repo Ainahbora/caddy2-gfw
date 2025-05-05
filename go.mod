@@ -4,6 +4,7 @@ go 1.24.2
 
 require (
 	github.com/caddyserver/caddy/v2 v2.9.1
+	github.com/fsnotify/fsnotify v1.4.7
 	go.uber.org/zap v1.27.0
 )
 

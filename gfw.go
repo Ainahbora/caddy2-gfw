@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -16,14 +17,17 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
 
 // 常量定义
 const (
 	// 默认配置
-	defaultBlacklistTTL    = 24 * time.Hour
-	defaultCleanupInterval = 5 * time.Minute
+	defaultBlacklistTTL     = 24 * time.Hour
+	defaultCleanupInterval  = 5 * time.Minute
+	defaultMaxBlacklistSize = 100000
+	defaultMaxConcurrent    = 1000
 
 	// 安全检测相关常量
 	sqlInjectionPatterns  = `(?i)(\b(select|insert|update|delete|drop|union|exec|where|from|into|load_file|outfile)\b.*\b(from|into|where|union|exec|load_file|outfile)\b|'.*'|".*"|\b(and|or)\b.*\b(1=1|2=2|true|false)\b|;.*\b(drop|delete|update|insert)\b|.*\bdrop\s+table\b)`
@@ -33,6 +37,17 @@ const (
 	cmdInjectionPatterns  = `(?i)(\b(cat|ls|rm|wget|curl|bash|sh|python|perl|ruby|php)\b.*\b(>|<|\||&|;)\b|\b(rm|del|remove)\s+(-rf?|/s|/q)\b|\b(cat|ls|rm|wget|curl)\b.*\b(/etc/passwd|/etc/shadow|/etc/hosts)\b|\bcat\s+/etc/passwd\b)`
 	codeInjectionPatterns = `(?i)(\b(eval|exec|system|passthru|shell_exec|assert|preg_replace)\s*\(.*\)|\b(include|require|include_once|require_once)\s*\(.*\))`
 	fileIncludePatterns   = `(?i)(\.\./|\.\.\\|\.\.\/|\.\.\\|\.\.\/\.\.\/|\.\.\\\.\.\\|\.\.\/\.\.\/\.\.\/|\.\.\\\.\.\\\.\.\\|php://|data://|phar://|zip://)`
+)
+
+// 预编译正则表达式
+var (
+	sqlInjectionRegex  = regexp.MustCompile(sqlInjectionPatterns)
+	xssRegex           = regexp.MustCompile(xssPatterns)
+	csrfRegex          = regexp.MustCompile(csrfPatterns)
+	ssrfRegex          = regexp.MustCompile(ssrfPatterns)
+	cmdInjectionRegex  = regexp.MustCompile(cmdInjectionPatterns)
+	codeInjectionRegex = regexp.MustCompile(codeInjectionPatterns)
+	fileIncludeRegex   = regexp.MustCompile(fileIncludePatterns)
 )
 
 // 错误定义
@@ -55,13 +70,17 @@ type GFW struct {
 	TTL           time.Duration `json:"ttl,omitempty"`
 
 	// 内部状态
-	blackList   map[string]time.Time
-	blackListMu sync.RWMutex
-	logger      *zap.Logger
-	ruleCache   *RuleCache
-	stopChan    chan struct{}
-	done        chan struct{} // 用于等待清理协程完成
-	lastModTime time.Time     // 规则文件最后修改时间
+	blackList        map[string]time.Time
+	blackListMu      sync.RWMutex
+	logger           *zap.Logger
+	ruleCache        *RuleCache
+	stopChan         chan struct{}
+	done             chan struct{}
+	lastModTime      time.Time
+	maxBlacklistSize int
+	maxConcurrent    int
+	semaphore        chan struct{}
+	watcher          *fsnotify.Watcher
 }
 
 // RuleCache 规则缓存
@@ -150,6 +169,9 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	g.blackList = make(map[string]time.Time)
 	g.stopChan = make(chan struct{})
 	g.done = make(chan struct{})
+	g.maxBlacklistSize = defaultMaxBlacklistSize
+	g.maxConcurrent = defaultMaxConcurrent
+	g.semaphore = make(chan struct{}, g.maxConcurrent)
 
 	// 设置默认值
 	if g.TTL == 0 {
@@ -165,7 +187,6 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 			g.logger.Error("从文件加载规则失败",
 				zap.Error(err),
 				zap.String("file", g.BlockRuleFile))
-			// 继续执行，不因为规则文件加载失败而中断服务
 		}
 		// 启动规则文件监控
 		go g.watchRuleFile()
@@ -186,6 +207,11 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 func (g *GFW) Cleanup() error {
 	close(g.stopChan)
 	<-g.done // 等待清理协程完成
+	if g.watcher != nil {
+		if err := g.watcher.Close(); err != nil {
+			g.logger.Error("关闭文件监控失败", zap.Error(err))
+		}
+	}
 	return nil
 }
 
@@ -214,8 +240,9 @@ func (g *GFW) cleanup() {
 
 	now := time.Now()
 	expiredCount := 0
-	expiredIPs := make([]string, 0)
+	expiredIPs := make([]string, 0, 100) // 预分配容量
 
+	// 批量收集过期IP
 	for ip, expireTime := range g.blackList {
 		if now.After(expireTime) {
 			expiredIPs = append(expiredIPs, ip)
@@ -223,7 +250,7 @@ func (g *GFW) cleanup() {
 		}
 	}
 
-	// 批量删除过期记录
+	// 批量删除
 	for _, ip := range expiredIPs {
 		delete(g.blackList, ip)
 	}
@@ -243,16 +270,20 @@ func (g *GFW) Validate() error {
 
 // ServeHTTP 实现caddyhttp.MiddlewareHandler接口，处理HTTP请求
 func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// 并发限制
+	select {
+	case g.semaphore <- struct{}{}:
+		defer func() { <-g.semaphore }()
+	default:
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return nil
+	}
+
 	// 获取客户端IP
 	clientIP := r.RemoteAddr
 
 	// 检查IP是否在黑名单中
-	g.blackListMu.RLock()
-	blacklistTime, isBlacklisted := g.blackList[clientIP]
-	g.blackListMu.RUnlock()
-
-	// 如果在黑名单中且未过期，直接返回403
-	if isBlacklisted && time.Now().Before(blacklistTime) {
+	if g.isIPBlacklisted(clientIP) {
 		g.logger.Info("拦截黑名单IP的请求",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path))
@@ -262,10 +293,8 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	// 检查请求是否合法
 	if !g.isRequestLegal(r) {
-		// 将IP加入黑名单，使用配置的TTL
-		g.blackListMu.Lock()
-		g.blackList[clientIP] = time.Now().Add(g.TTL)
-		g.blackListMu.Unlock()
+		// 将IP加入黑名单
+		g.addToBlacklist(clientIP)
 
 		g.logger.Warn("检测到恶意请求",
 			zap.String("ip", clientIP),
@@ -279,6 +308,52 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	// 请求合法，继续处理
 	return next.ServeHTTP(w, r)
+}
+
+// isIPBlacklisted 检查IP是否在黑名单中
+func (g *GFW) isIPBlacklisted(ip string) bool {
+	g.blackListMu.RLock()
+	defer g.blackListMu.RUnlock()
+
+	expireTime, exists := g.blackList[ip]
+	if !exists {
+		return false
+	}
+
+	return time.Now().Before(expireTime)
+}
+
+// addToBlacklist 将IP添加到黑名单
+func (g *GFW) addToBlacklist(ip string) {
+	g.blackListMu.Lock()
+	defer g.blackListMu.Unlock()
+
+	// 检查黑名单大小
+	if len(g.blackList) >= g.maxBlacklistSize {
+		// 清理最旧的记录
+		g.cleanupOldest()
+	}
+
+	g.blackList[ip] = time.Now().Add(g.TTL)
+}
+
+// cleanupOldest 清理最旧的黑名单记录
+func (g *GFW) cleanupOldest() {
+	var oldestIP string
+	var oldestTime time.Time
+
+	// 找到最旧的记录
+	for ip, expireTime := range g.blackList {
+		if oldestIP == "" || expireTime.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = expireTime
+		}
+	}
+
+	// 删除最旧的记录
+	if oldestIP != "" {
+		delete(g.blackList, oldestIP)
+	}
 }
 
 // isRequestLegal 检查请求是否合法
@@ -375,12 +450,13 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 		for _, value := range values {
 			// 检查完整的参数值
 			fullValue := key + "=" + value
-			if strings.Contains(strings.ToLower(fullValue), "drop table") {
+			lowerValue := strings.ToLower(fullValue)
+			if strings.Contains(lowerValue, "drop table") {
 				return true
 			}
 
 			// 检查SQL注入模式
-			if g.matchPattern(value, sqlInjectionPatterns) {
+			if sqlInjectionRegex.MatchString(value) {
 				return true
 			}
 
@@ -402,13 +478,13 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 						return true
 					}
 					// 检查其他SQL命令
-					if g.matchPattern(part, `(?i)\b(drop|delete|update|insert)\b`) {
+					if sqlInjectionRegex.MatchString(part) {
 						return true
 					}
 				}
 			}
 			// 检查参数名
-			if g.matchPattern(key, `(?i)\b(drop|delete|update|insert)\b`) {
+			if sqlInjectionRegex.MatchString(key) {
 				return true
 			}
 		}
@@ -421,12 +497,13 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 				for _, value := range values {
 					// 检查完整的参数值
 					fullValue := key + "=" + value
-					if strings.Contains(strings.ToLower(fullValue), "drop table") {
+					lowerValue := strings.ToLower(fullValue)
+					if strings.Contains(lowerValue, "drop table") {
 						return true
 					}
 
 					// 检查SQL注入模式
-					if g.matchPattern(value, sqlInjectionPatterns) {
+					if sqlInjectionRegex.MatchString(value) {
 						return true
 					}
 
@@ -448,13 +525,13 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 								return true
 							}
 							// 检查其他SQL命令
-							if g.matchPattern(part, `(?i)\b(drop|delete|update|insert)\b`) {
+							if sqlInjectionRegex.MatchString(part) {
 								return true
 							}
 						}
 					}
 					// 检查参数名
-					if g.matchPattern(key, `(?i)\b(drop|delete|update|insert)\b`) {
+					if sqlInjectionRegex.MatchString(key) {
 						return true
 					}
 				}
@@ -476,7 +553,7 @@ func (g *GFW) detectXSS(r *http.Request) bool {
 	// 检查URL参数
 	for _, values := range r.URL.Query() {
 		for _, value := range values {
-			if g.matchPattern(value, xssPatterns) {
+			if xssRegex.MatchString(value) {
 				return true
 			}
 		}
@@ -487,7 +564,7 @@ func (g *GFW) detectXSS(r *http.Request) bool {
 		if err := r.ParseForm(); err == nil {
 			for _, values := range r.PostForm {
 				for _, value := range values {
-					if g.matchPattern(value, xssPatterns) {
+					if xssRegex.MatchString(value) {
 						return true
 					}
 				}
@@ -530,7 +607,7 @@ func (g *GFW) detectSSRF(r *http.Request) bool {
 	// 检查URL参数
 	for _, values := range r.URL.Query() {
 		for _, value := range values {
-			if g.matchPattern(value, ssrfPatterns) {
+			if ssrfRegex.MatchString(value) {
 				return true
 			}
 		}
@@ -541,7 +618,7 @@ func (g *GFW) detectSSRF(r *http.Request) bool {
 		if err := r.ParseForm(); err == nil {
 			for _, values := range r.PostForm {
 				for _, value := range values {
-					if g.matchPattern(value, ssrfPatterns) {
+					if ssrfRegex.MatchString(value) {
 						return true
 					}
 				}
@@ -558,7 +635,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 	for _, values := range r.URL.Query() {
 		for _, value := range values {
 			// 检查命令注入模式
-			if g.matchPattern(value, cmdInjectionPatterns) {
+			if cmdInjectionRegex.MatchString(value) {
 				return true
 			}
 			// 检查管道符号
@@ -575,7 +652,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 				return true
 			}
 			// 检查系统命令
-			if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+			if cmdInjectionRegex.MatchString(value) {
 				return true
 			}
 		}
@@ -587,7 +664,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 			for _, values := range r.PostForm {
 				for _, value := range values {
 					// 检查命令注入模式
-					if g.matchPattern(value, cmdInjectionPatterns) {
+					if cmdInjectionRegex.MatchString(value) {
 						return true
 					}
 					// 检查管道符号
@@ -604,7 +681,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 						return true
 					}
 					// 检查系统命令
-					if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+					if cmdInjectionRegex.MatchString(value) {
 						return true
 					}
 				}
@@ -616,7 +693,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 	for _, header := range r.Header {
 		for _, value := range header {
 			// 检查命令注入模式
-			if g.matchPattern(value, cmdInjectionPatterns) {
+			if cmdInjectionRegex.MatchString(value) {
 				return true
 			}
 			// 检查管道符号
@@ -633,7 +710,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 				return true
 			}
 			// 检查系统命令
-			if g.matchPattern(value, `(?i)\b(cat|ls|rm|wget|curl|bash|sh)\b`) {
+			if cmdInjectionRegex.MatchString(value) {
 				return true
 			}
 		}
@@ -647,7 +724,7 @@ func (g *GFW) detectCodeInjection(r *http.Request) bool {
 	// 检查URL参数
 	for _, values := range r.URL.Query() {
 		for _, value := range values {
-			if g.matchPattern(value, codeInjectionPatterns) {
+			if codeInjectionRegex.MatchString(value) {
 				return true
 			}
 		}
@@ -658,7 +735,7 @@ func (g *GFW) detectCodeInjection(r *http.Request) bool {
 		if err := r.ParseForm(); err == nil {
 			for _, values := range r.PostForm {
 				for _, value := range values {
-					if g.matchPattern(value, codeInjectionPatterns) {
+					if codeInjectionRegex.MatchString(value) {
 						return true
 					}
 				}
@@ -675,7 +752,7 @@ func (g *GFW) detectFileInclude(r *http.Request) bool {
 	for _, values := range r.URL.Query() {
 		for _, value := range values {
 			// 检查文件包含模式
-			if g.matchPattern(value, fileIncludePatterns) {
+			if fileIncludeRegex.MatchString(value) {
 				return true
 			}
 			// 检查PHP伪协议
@@ -696,7 +773,7 @@ func (g *GFW) detectFileInclude(r *http.Request) bool {
 			for _, values := range r.PostForm {
 				for _, value := range values {
 					// 检查文件包含模式
-					if g.matchPattern(value, fileIncludePatterns) {
+					if fileIncludeRegex.MatchString(value) {
 						return true
 					}
 					// 检查PHP伪协议
@@ -717,7 +794,7 @@ func (g *GFW) detectFileInclude(r *http.Request) bool {
 	for _, header := range r.Header {
 		for _, value := range header {
 			// 检查文件包含模式
-			if g.matchPattern(value, fileIncludePatterns) {
+			if fileIncludeRegex.MatchString(value) {
 				return true
 			}
 			// 检查PHP伪协议
@@ -735,16 +812,75 @@ func (g *GFW) detectFileInclude(r *http.Request) bool {
 	return false
 }
 
-// matchPattern 使用正则表达式匹配模式
-func (g *GFW) matchPattern(value, pattern string) bool {
-	matched, err := regexp.MatchString(pattern, value)
+// watchRuleFile 监控规则文件变化
+func (g *GFW) watchRuleFile() {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		g.logger.Error("正则表达式匹配失败",
-			zap.Error(err),
-			zap.String("pattern", pattern))
-		return false
+		g.logger.Error("创建文件监控失败", zap.Error(err))
+		return
 	}
-	return matched
+	g.watcher = watcher
+
+	// 获取规则文件所在目录
+	ruleDir := filepath.Dir(g.BlockRuleFile)
+	ruleFile := filepath.Base(g.BlockRuleFile)
+
+	// 监控目录而不是单个文件
+	if err := watcher.Add(ruleDir); err != nil {
+		g.logger.Error("添加目录监控失败",
+			zap.Error(err),
+			zap.String("directory", ruleDir))
+		return
+	}
+
+	go func() {
+		defer watcher.Close()
+		for {
+			select {
+			case event := <-watcher.Events:
+				// 只处理目标文件的事件
+				if filepath.Base(event.Name) == ruleFile {
+					switch {
+					case event.Op&fsnotify.Write == fsnotify.Write:
+						// 添加延迟，等待文件写入完成
+						time.Sleep(100 * time.Millisecond)
+						if err := g.loadRulesFromFile(); err != nil {
+							g.logger.Error("重新加载规则失败",
+								zap.Error(err),
+								zap.String("file", g.BlockRuleFile))
+						}
+					case event.Op&fsnotify.Remove == fsnotify.Remove:
+						// 文件被删除，尝试重新添加监控
+						time.Sleep(100 * time.Millisecond)
+						if err := watcher.Add(ruleDir); err != nil {
+							g.logger.Error("重新添加目录监控失败",
+								zap.Error(err),
+								zap.String("directory", ruleDir))
+						}
+					}
+				}
+			case err := <-watcher.Errors:
+				if err != nil {
+					g.logger.Error("文件监控错误",
+						zap.Error(err),
+						zap.String("directory", ruleDir))
+					// 尝试重新添加监控
+					time.Sleep(1 * time.Second)
+					if err := watcher.Add(ruleDir); err != nil {
+						g.logger.Error("重新添加目录监控失败",
+							zap.Error(err),
+							zap.String("directory", ruleDir))
+					}
+				}
+			case <-g.stopChan:
+				return
+			}
+		}
+	}()
+
+	g.logger.Info("文件监控已启动",
+		zap.String("directory", ruleDir),
+		zap.String("file", ruleFile))
 }
 
 // loadRulesFromFile 从文件中加载规则
@@ -808,50 +944,6 @@ func (g *GFW) loadRulesFromFile() error {
 		zap.Time("last_modified", g.lastModTime))
 
 	return nil
-}
-
-// checkAndReloadRules 检查并重新加载规则
-func (g *GFW) checkAndReloadRules() error {
-	// 获取文件信息
-	fileInfo, err := os.Stat(g.BlockRuleFile)
-	if err != nil {
-		return fmt.Errorf("获取规则文件信息失败: %w", err)
-	}
-
-	// 检查文件是否被修改
-	if fileInfo.ModTime().Equal(g.lastModTime) {
-		return nil
-	}
-
-	// 重新加载规则
-	if err := g.loadRulesFromFile(); err != nil {
-		return fmt.Errorf("重新加载规则失败: %w", err)
-	}
-
-	g.logger.Info("规则文件已更新",
-		zap.String("file", g.BlockRuleFile),
-		zap.Time("last_modified", fileInfo.ModTime()))
-
-	return nil
-}
-
-// watchRuleFile 监控规则文件变化
-func (g *GFW) watchRuleFile() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := g.checkAndReloadRules(); err != nil {
-				g.logger.Error("检查规则文件更新失败",
-					zap.Error(err),
-					zap.String("file", g.BlockRuleFile))
-			}
-		case <-g.stopChan:
-			return
-		}
-	}
 }
 
 // parseCaddyfile 解析Caddyfile配置
