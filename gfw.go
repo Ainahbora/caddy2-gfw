@@ -791,23 +791,28 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 		for _, value := range values {
 			// 检查命令注入模式
 			if cmdInjectionRegex.MatchString(value) {
+			    g.logger.Error("检查命令注入模式", zap.String("value", value))
 				return true
 			}
 			// 检查管道符号
 			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+			    g.logger.Error("检查管道符号", zap.String("value", value))
 				return true
 			}
 			// 检查重定向符号
 			if strings.Contains(value, ">") || strings.Contains(value, "<") {
+			    g.logger.Error("检查重定向符号", zap.String("value", value))
 				return true
 			}
 			// 检查敏感文件路径
 			if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
 				strings.Contains(value, "/etc/hosts") {
+				g.logger.Error("检查敏感文件路径", zap.String("value", value))
 				return true
 			}
 			// 检查系统命令
 			if cmdInjectionRegex.MatchString(value) {
+			    g.logger.Error("检查系统命令", zap.String("value", value))
 				return true
 			}
 		}
@@ -820,23 +825,28 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 				for _, value := range values {
 					// 检查命令注入模式
 					if cmdInjectionRegex.MatchString(value) {
+					    g.logger.Error("POST 检查命令注入模式", zap.String("value", value))
 						return true
 					}
 					// 检查管道符号
 					if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+					    g.logger.Error("POST 检查管道符号", zap.String("value", value))
 						return true
 					}
 					// 检查重定向符号
 					if strings.Contains(value, ">") || strings.Contains(value, "<") {
+					    g.logger.Error("POST 检查重定向符号", zap.String("value", value))
 						return true
 					}
 					// 检查敏感文件路径
 					if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
 						strings.Contains(value, "/etc/hosts") {
+						g.logger.Error("POST 检查敏感文件路径", zap.String("value", value))
 						return true
 					}
 					// 检查系统命令
 					if cmdInjectionRegex.MatchString(value) {
+					    g.logger.Error("POST 检查系统命令", zap.String("value", value))
 						return true
 					}
 				}
@@ -849,23 +859,28 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 		for _, value := range header {
 			// 检查命令注入模式
 			if cmdInjectionRegex.MatchString(value) {
+			    g.logger.Error("header 检查命令注入模式", zap.String("value", value))
 				return true
 			}
 			// 检查管道符号
 			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
+			    g.logger.Error("header 检查管道符号", zap.String("value", value))
 				return true
 			}
 			// 检查重定向符号
 			if strings.Contains(value, ">") || strings.Contains(value, "<") {
+			    g.logger.Error("header 检查重定向符号", zap.String("value", value))
 				return true
 			}
 			// 检查敏感文件路径
 			if strings.Contains(value, "/etc/passwd") || strings.Contains(value, "/etc/shadow") ||
 				strings.Contains(value, "/etc/hosts") {
+				g.logger.Error("header 检查敏感文件路径", zap.String("value", value))
 				return true
 			}
 			// 检查系统命令
 			if cmdInjectionRegex.MatchString(value) {
+			    g.logger.Error("header 检查系统命令", zap.String("value", value))
 				return true
 			}
 		}
