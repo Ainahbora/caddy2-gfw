@@ -288,8 +288,8 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	g.logger.Info("GFW module initialized",
 		zap.String("block_rule_file", g.BlockRuleFile),
 		zap.Strings("block_rules", g.BlockRules),
-		zap.Duration("ttl", g.TTL))
-
+// 		zap.Duration("ttl", g.TTL))
+        zap.Duration("ttl", time.Duration(g.TTL)))
 	return nil
 }
 
