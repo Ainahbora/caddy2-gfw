@@ -1,4 +1,4 @@
-module github.com/ysicing/caddy2-gfw
+module github.com/Ainahbora/caddy2-gfw
 
 go 1.24.2
 
