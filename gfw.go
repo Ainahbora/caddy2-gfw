@@ -93,7 +93,7 @@ type GFW struct {
 	// 配置选项
 	BlockRules    []string      `json:"block_rules,omitempty"`
 	BlockRuleFile string        `json:"block_rule_file,omitempty"`
-	TTL           time.Duration `json:"ttl,omitempty"`
+	TTL           caddy.Duration `json:"ttl,omitempty"`
 	EnableExtra   bool          `json:"enable_extra,omitempty"` // 是否启用额外安全检测
 	BlockAll      bool          `json:"block_all,omitempty"`    // 规则匹配时是否拦截所有请求
 
@@ -168,8 +168,14 @@ func (rc *RuleCache) MatchURL(url string) bool {
 func (rc *RuleCache) MatchUserAgent(ua string) bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	_, exists := rc.uaSet[ua]
-	return exists
+// 	_, exists := rc.uaSet[ua]
+// 	return exists
+    for pattern := range rc.uaSet {
+		if strings.Contains(strings.ToLower(ua), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetAllRules 返回所有规则
@@ -204,7 +210,8 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 
 	// 设置默认值
 	if g.TTL == 0 {
-		g.TTL = defaultBlacklistTTL
+		//g.TTL = defaultBlacklistTTL
+		g.TTL = caddy.Duration(24 * time.Hour)
 	}
 
 	// 全局只注册一次 metrics
@@ -380,8 +387,11 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 
 	// 获取客户端IP
-	clientIP := r.RemoteAddr
-
+// 	clientIP := r.RemoteAddr
+    clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+    if err != nil {
+        clientIP = r.RemoteAddr
+    }
 	// 检查IP是否在黑名单中
 	if g.isIPBlacklisted(clientIP) {
 		requestsTotal.WithLabelValues("blacklisted").Inc()
@@ -451,8 +461,8 @@ func (g *GFW) addToBlacklist(ip string) {
 		g.cleanupOldest()
 	}
 
-	g.blackList[ip] = time.Now().Add(g.TTL)
-
+	//g.blackList[ip] = time.Now().Add(g.TTL)
+    g.blackList[ip] = time.Now().Add(time.Duration(g.TTL))
 	// 异步保存黑名单
 	go func() {
 		if err := g.saveBlacklist(); err != nil {
@@ -485,8 +495,11 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 	// 获取请求信息
 	userAgent := r.UserAgent()
 	requestPath := r.URL.Path
-	clientIP := r.RemoteAddr
-
+// 	clientIP := r.RemoteAddr
+    clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+    if err != nil {
+        clientIP = r.RemoteAddr
+    }
 	// 使用规则缓存进行匹配（基本安全检测）
 	if g.ruleCache != nil {
 		if g.ruleCache.MatchIP(clientIP) {
@@ -1113,12 +1126,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				if !h.NextArg() {
 					return nil, h.ArgErr()
 				}
-				duration, err := time.ParseDuration(h.Val())
+// 				duration, err := time.ParseDuration(h.Val())
+                duration, err := caddy.ParseDuration(h.Val())
 				if err != nil {
 					return nil, h.Errf("invalid ttl duration: %v", err)
 				}
-				g.TTL = duration
-
+// 				g.TTL = duration
+                g.TTL = caddy.Duration(duration)
 			case "enable_extra":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
@@ -1172,11 +1186,13 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				duration, err := time.ParseDuration(d.Val())
+// 				duration, err := time.ParseDuration(d.Val())
+				duration, err := caddy.ParseDuration(d.Val())
 				if err != nil {
 					return d.Errf("invalid ttl duration: %v", err)
 				}
-				g.TTL = duration
+// 				g.TTL = duration
+                g.TTL = caddy.Duration(duration)
 
 			case "enable_extra":
 				if !d.NextArg() {
