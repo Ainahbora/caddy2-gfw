@@ -37,6 +37,7 @@ const (
 	defaultMaxConcurrent    = 1000
 	defaultMessage          = "403 Forbidden"
 	defaultRawResponder     = "block"
+	defaultUrl              = "http://127.0.0.1"
 
 	// 安全检测相关常量
 	sqlInjectionPatterns  = `(?i)(\b(select|insert|update|delete|drop|union|exec|where|from|into|load_file|outfile)\b.*\b(from|into|where|union|exec|load_file|outfile)\b|'.*'|".*"|\b(and|or)\b.*\b(1=1|2=2|true|false)\b|;.*\b(drop|delete|update|insert)\b|.*\bdrop\s+table\b)`
@@ -101,6 +102,7 @@ type GFW struct {
 	BlockAll      bool          `json:"block_all,omitempty"`    // 规则匹配时是否拦截所有请求
 	Message       string        `json:"message,omitempty"`      // 自定义消息
 	RawResponder  string        `json:"raw_responder,omitempty"`          // 拦截模式
+    Url           string        `json:"url,omitempty"`      // 反弹地址
 
 	// 内部状态
 	blackList        map[string]time.Time
@@ -227,6 +229,11 @@ func (g *GFW) Provision(ctx caddy.Context) error {
     // 设置拦截类型
     if g.RawResponder == "" {
         g.RawResponder = defaultRawResponder
+    }
+
+    // 设置反弹地址
+    if g.Url == "" {
+        g.Url = defaultUrl
     }
 
 	// 全局只注册一次 metrics
@@ -417,7 +424,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		// http.Error(w, "blocked by gfw", http.StatusForbidden)
 
 		if g.RawResponder == "redirect" {
-            http.Redirect(w, r, g.Message, http.StatusPermanentRedirect)
+            http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
 		} else {
 		    http.Error(w, g.Message, http.StatusForbidden)
 		}
@@ -454,11 +461,10 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		// http.Error(w, "blocked by gfw", http.StatusForbidden)
 
 		if g.RawResponder == "redirect" {
-            http.Redirect(w, r, g.Message, http.StatusPermanentRedirect)
+            http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
 		} else {
 		    http.Error(w, g.Message, http.StatusForbidden)
 		}
-
 
 		return nil
 	}
@@ -1211,6 +1217,12 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.RawResponder = h.Val()
 
+			 case "url":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				g.Url = h.Val()
+
 			default:
 				return nil, h.Errf("unknown subdirective '%s'", h.Val())
 			}
@@ -1283,6 +1295,12 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				g.RawResponder = d.Val()
+
+			 case "url":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				g.Url = d.Val()
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
