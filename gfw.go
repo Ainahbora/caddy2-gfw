@@ -98,11 +98,11 @@ type GFW struct {
 	BlockRules    []string      `json:"block_rules,omitempty"`
 	BlockRuleFile string        `json:"block_rule_file,omitempty"`
 	TTL           caddy.Duration `json:"ttl,omitempty"`
-	EnableExtra   bool          `json:"enable_extra,omitempty"` // 是否启用额外安全检测
-	BlockAll      bool          `json:"block_all,omitempty"`    // 规则匹配时是否拦截所有请求
-	Message       string        `json:"message,omitempty"`      // 自定义消息
+	EnableExtra   bool          `json:"enable_extra,omitempty"`           // 是否启用额外安全检测
+	BlockAll      bool          `json:"block_all,omitempty"`              // 规则匹配时是否拦截所有请求
+	Message       string        `json:"message,omitempty"`                // 自定义消息
 	RawResponder  string        `json:"raw_responder,omitempty"`          // 拦截模式
-    Url           string        `json:"url,omitempty"`      // 反弹地址
+    Url           string        `json:"url,omitempty"`                    // 反弹地址
 
 	// 内部状态
 	blackList        map[string]time.Time
@@ -309,8 +309,7 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	g.logger.Info("GFW module initialized",
 		zap.String("block_rule_file", g.BlockRuleFile),
 		zap.Strings("block_rules", g.BlockRules),
-// 		zap.Duration("ttl", g.TTL))
-        zap.Duration("ttl", time.Duration(g.TTL)))
+		zap.Duration("ttl", time.Duration(g.TTL)))
 	return nil
 }
 
@@ -465,7 +464,6 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		} else {
 		    http.Error(w, g.Message, http.StatusForbidden)
 		}
-
 		return nil
 	}
 
