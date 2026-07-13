@@ -40,7 +40,7 @@ const (
 	defaultUrl              = "http://127.0.0.1"
 
 	// 安全检测相关常量
-	sqlInjectionPatterns  = `(?i)(\b(select|insert|update|delete|drop|union|exec|where|from|into|load_file|outfile)\b.*\b(from|into|where|union|exec|load_file|outfile)\b|'.*'|".*"|\b(and|or)\b.*\b(1=1|2=2|true|false)\b|;.*\b(drop|delete|update|insert)\b|.*\bdrop\s+table\b)`
+	sqlInjectionPatterns  = `(?i)(\b(select|insert|update|delete|drop|union|exec|where|from|into|load_file|outfile)\b.*\b(from|into|where|union|exec|load_file|outfile)\b|\b(and|or)\b\s+['"]?\d+['"]?\s*=\s*['"]?\d+['"]?|\b(and|or)\b.*\b(1=1|2=2|true|false)\b|;.*\b(drop|delete|update|insert)\b|.*\bdrop\s+table\b)`
 	xssPatterns           = `(?i)(<script|javascript:|on\w+\s*=|data:|vbscript:|expression\s*\(|eval\s*\(|alert\s*\()`
 	csrfPatterns          = `(?i)(_csrf|csrf_token|xsrf_token)`
 	ssrfPatterns          = `(?i)(127\.0\.0\.1|localhost|0\.0\.0\.0|::1|file://|gopher://|dict://)`
@@ -87,6 +87,40 @@ var (
 	requestDuration  prometheus.Histogram
 )
 
+func incCounter(counter *prometheus.CounterVec, labels ...string) {
+	if counter != nil {
+		counter.WithLabelValues(labels...).Inc()
+	}
+}
+
+func setGauge(gauge prometheus.Gauge, value float64) {
+	if gauge != nil {
+		gauge.Set(value)
+	}
+}
+
+func observeHistogram(histogram prometheus.Histogram, value float64) {
+	if histogram != nil {
+		histogram.Observe(value)
+	}
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func isDirectIPHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	return net.ParseIP(host) != nil
+}
+
 func init() {
 	caddy.RegisterModule(&GFW{})
 	httpcaddyfile.RegisterHandlerDirective("gfw", parseCaddyfile)
@@ -95,21 +129,23 @@ func init() {
 // GFW 实现了一个Caddy HTTP处理器，用于检测恶意请求
 type GFW struct {
 	// 配置选项
-	BlockRules     []string       `json:"block_rules,omitempty"`
-	BlockRuleFile  string         `json:"block_rule_file,omitempty"`
-	TTL            caddy.Duration `json:"ttl,omitempty"`
-	EnableExtra    bool           `json:"enable_extra,omitempty"` // 是否启用额外安全检测
-	DisableIPCheck bool           `json:"disable_ip_check,omitempty"`
-	BlockAll       bool           `json:"block_all,omitempty"`     // 规则匹配时是否拦截所有请求
-	Message        string         `json:"message,omitempty"`       // 自定义消息
-	RawResponder   string         `json:"raw_responder,omitempty"` // 拦截模式
-	Url            string         `json:"url,omitempty"`           // 反弹地址
+	BlockRules    []string       `json:"block_rules,omitempty"`
+	BlockRuleFile string         `json:"block_rule_file,omitempty"`
+	TTL           caddy.Duration `json:"ttl,omitempty"`
+	EnableExtra   bool           `json:"enable_extra,omitempty"` // 是否启用额外安全检测
+	EnableIPCheck bool           `json:"enable_ip_check,omitempty"`
+	BlockAll      bool           `json:"block_all,omitempty"`     // 规则匹配时是否拦截所有请求
+	Message       string         `json:"message,omitempty"`       // 自定义消息
+	RawResponder  string         `json:"raw_responder,omitempty"` // 拦截模式
+	Url           string         `json:"url,omitempty"`           // 反弹地址
 
 	// 内部状态
 	blackList        map[string]time.Time
 	blackListMu      sync.RWMutex
 	logger           *zap.Logger
 	ruleCache        *RuleCache
+	ruleCacheMu      sync.RWMutex
+	inlineRules      []string
 	stopChan         chan struct{}
 	done             chan struct{}
 	lastModTime      time.Time
@@ -141,18 +177,30 @@ func NewRuleCache() *RuleCache {
 
 // AddRule 添加规则到缓存
 func (rc *RuleCache) AddRule(rule string) {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return
+	}
+
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
 	rc.rules[rule] = struct{}{}
 
 	// 根据规则类型添加到对应的集合
-	if strings.HasPrefix(rule, "ip:") {
-		rc.ipSet[rule[3:]] = struct{}{}
-	} else if strings.HasPrefix(rule, "url:") {
-		rc.urlSet[rule[4:]] = struct{}{}
-	} else if strings.HasPrefix(rule, "ua:") {
-		rc.uaSet[rule[3:]] = struct{}{}
+	switch {
+	case strings.HasPrefix(rule, "ip:"):
+		if value := strings.TrimSpace(rule[3:]); value != "" {
+			rc.ipSet[value] = struct{}{}
+		}
+	case strings.HasPrefix(rule, "url:"):
+		if value := strings.TrimSpace(rule[4:]); value != "" {
+			rc.urlSet[value] = struct{}{}
+		}
+	case strings.HasPrefix(rule, "ua:"):
+		if value := strings.ToLower(strings.TrimSpace(rule[3:])); value != "" {
+			rc.uaSet[value] = struct{}{}
+		}
 	}
 }
 
@@ -174,12 +222,12 @@ func (rc *RuleCache) MatchURL(url string) bool {
 
 // MatchUserAgent 检查User-Agent是否匹配规则
 func (rc *RuleCache) MatchUserAgent(ua string) bool {
+	ua = strings.ToLower(ua)
+
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	// 	_, exists := rc.uaSet[ua]
-	// 	return exists
 	for pattern := range rc.uaSet {
-		if strings.Contains(strings.ToLower(ua), strings.ToLower(pattern)) {
+		if strings.Contains(ua, pattern) {
 			return true
 		}
 	}
@@ -196,6 +244,18 @@ func (rc *RuleCache) GetAllRules() map[string]struct{} {
 		rules[rule] = struct{}{}
 	}
 	return rules
+}
+
+func (g *GFW) getRuleCache() *RuleCache {
+	g.ruleCacheMu.RLock()
+	defer g.ruleCacheMu.RUnlock()
+	return g.ruleCache
+}
+
+func (g *GFW) setRuleCache(cache *RuleCache) {
+	g.ruleCacheMu.Lock()
+	g.ruleCache = cache
+	g.ruleCacheMu.Unlock()
 }
 
 // CaddyModule 返回Caddy模块信息
@@ -238,44 +298,42 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	}
 
 	// 全局只注册一次 metrics
-	metricsOnce.Do(func() {
-		registry := ctx.GetMetricsRegistry()
-		if registry == nil {
-			return
-		}
-		const ns, sub = "caddy", "gfw"
-		requestsTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
-			Namespace: ns,
-			Subsystem: sub,
-			Name:      "requests_total",
-			Help:      "Total number of requests processed by GFW",
-		}, []string{"status"})
-		attackDetections = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
-			Namespace: ns,
-			Subsystem: sub,
-			Name:      "attack_detections_total",
-			Help:      "Total number of detected attacks by GFW",
-		}, []string{"type"})
-		blacklistSize = promauto.With(registry).NewGauge(prometheus.GaugeOpts{
-			Namespace: ns,
-			Subsystem: sub,
-			Name:      "blacklist_size",
-			Help:      "Current number of IPs in GFW blacklist",
+	if registry := ctx.GetMetricsRegistry(); registry != nil {
+		metricsOnce.Do(func() {
+			const ns, sub = "caddy", "gfw"
+			requestsTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+				Namespace: ns,
+				Subsystem: sub,
+				Name:      "requests_total",
+				Help:      "Total number of requests processed by GFW",
+			}, []string{"status"})
+			attackDetections = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+				Namespace: ns,
+				Subsystem: sub,
+				Name:      "attack_detections_total",
+				Help:      "Total number of detected attacks by GFW",
+			}, []string{"type"})
+			blacklistSize = promauto.With(registry).NewGauge(prometheus.GaugeOpts{
+				Namespace: ns,
+				Subsystem: sub,
+				Name:      "blacklist_size",
+				Help:      "Current number of IPs in GFW blacklist",
+			})
+			ruleMatches = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+				Namespace: ns,
+				Subsystem: sub,
+				Name:      "rule_matches_total",
+				Help:      "Total number of rule matches by GFW",
+			}, []string{"type"})
+			requestDuration = promauto.With(registry).NewHistogram(prometheus.HistogramOpts{
+				Namespace: ns,
+				Subsystem: sub,
+				Name:      "request_duration_seconds",
+				Help:      "Request processing duration by GFW in seconds",
+				Buckets:   prometheus.DefBuckets,
+			})
 		})
-		ruleMatches = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
-			Namespace: ns,
-			Subsystem: sub,
-			Name:      "rule_matches_total",
-			Help:      "Total number of rule matches by GFW",
-		}, []string{"type"})
-		requestDuration = promauto.With(registry).NewHistogram(prometheus.HistogramOpts{
-			Namespace: ns,
-			Subsystem: sub,
-			Name:      "request_duration_seconds",
-			Help:      "Request processing duration by GFW in seconds",
-			Buckets:   prometheus.DefBuckets,
-		})
-	})
+	}
 
 	// 初始化存储
 	storageDir := filepath.Join(caddy.AppDataDir(), "gfw")
@@ -291,7 +349,12 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 	}
 
 	// 初始化规则缓存
-	g.ruleCache = NewRuleCache()
+	g.inlineRules = append([]string(nil), g.BlockRules...)
+	ruleCache := NewRuleCache()
+	for _, rule := range g.inlineRules {
+		ruleCache.AddRule(rule)
+	}
+	g.setRuleCache(ruleCache)
 
 	// 如果指定了规则文件，从文件中读取规则
 	if g.BlockRuleFile != "" {
@@ -347,17 +410,13 @@ func (g *GFW) cleanupBlacklist() {
 // cleanup 清理过期的黑名单记录
 func (g *GFW) cleanup() {
 	g.blackListMu.Lock()
-	defer g.blackListMu.Unlock()
-
 	now := time.Now()
-	expiredCount := 0
 	expiredIPs := make([]string, 0, 100) // 预分配容量
 
 	// 批量收集过期IP
 	for ip, expireTime := range g.blackList {
 		if now.After(expireTime) {
 			expiredIPs = append(expiredIPs, ip)
-			expiredCount++
 		}
 	}
 
@@ -367,12 +426,14 @@ func (g *GFW) cleanup() {
 	}
 
 	// 更新黑名单大小指标
-	blacklistSize.Set(float64(len(g.blackList)))
+	setGauge(blacklistSize, float64(len(g.blackList)))
+	remainingCount := len(g.blackList)
+	g.blackListMu.Unlock()
 
-	if expiredCount > 0 {
+	if len(expiredIPs) > 0 {
 		g.logger.Debug("cleaned up expired blacklist entries",
-			zap.Int("expired_count", expiredCount),
-			zap.Int("remaining_count", len(g.blackList)),
+			zap.Int("expired_count", len(expiredIPs)),
+			zap.Int("remaining_count", remainingCount),
 			zap.Strings("expired_ips", expiredIPs))
 
 		// 异步保存更新后的黑名单
@@ -386,6 +447,21 @@ func (g *GFW) cleanup() {
 
 // Validate 实现caddy.Validator接口，验证配置
 func (g *GFW) Validate() error {
+	if g.TTL < 0 {
+		return fmt.Errorf("%w: ttl must not be negative", ErrInvalidConfig)
+	}
+	if g.RawResponder != "" && g.RawResponder != "block" && g.RawResponder != "redirect" {
+		return fmt.Errorf("%w: raw_responder must be either block or redirect", ErrInvalidConfig)
+	}
+	if g.RawResponder == "redirect" {
+		redirectURL := g.Url
+		if redirectURL == "" {
+			redirectURL = defaultUrl
+		}
+		if _, err := url.ParseRequestURI(redirectURL); err != nil {
+			return fmt.Errorf("%w: invalid redirect url: %w", ErrInvalidConfig, err)
+		}
+	}
 	return nil
 }
 
@@ -395,7 +471,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	start := time.Now()
 	defer func() {
 		// 记录请求处理时间
-		requestDuration.Observe(time.Since(start).Seconds())
+		observeHistogram(requestDuration, time.Since(start).Seconds())
 	}()
 
 	// 并发限制
@@ -403,20 +479,16 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	case g.semaphore <- struct{}{}:
 		defer func() { <-g.semaphore }()
 	default:
-		requestsTotal.WithLabelValues("too_many_requests").Inc()
+		incCounter(requestsTotal, "too_many_requests")
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return nil
 	}
 
 	// 获取客户端IP
-	// 	clientIP := r.RemoteAddr
-	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		clientIP = r.RemoteAddr
-	}
+	clientIP := clientIPFromRequest(r)
 	// 检查IP是否在黑名单中
 	if g.isIPBlacklisted(clientIP) {
-		requestsTotal.WithLabelValues("blacklisted").Inc()
+		incCounter(requestsTotal, "blacklisted")
 		g.logger.Info("blocked request due to blacklisted IP",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path))
@@ -450,7 +522,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 				zap.String("attack_type", attackType))
 		}
 
-		requestsTotal.WithLabelValues("blocked").Inc()
+		incCounter(requestsTotal, "blocked")
 		g.logger.Warn("detected malicious request",
 			zap.String("ip", clientIP),
 			zap.String("path", r.URL.Path),
@@ -469,7 +541,7 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 
 	// 请求合法，继续处理
-	requestsTotal.WithLabelValues("allowed").Inc()
+	incCounter(requestsTotal, "allowed")
 	return next.ServeHTTP(w, r)
 }
 
@@ -488,8 +560,11 @@ func (g *GFW) isIPBlacklisted(ip string) bool {
 
 // addToBlacklist 将IP添加到黑名单
 func (g *GFW) addToBlacklist(ip string) {
+	if ip == "" {
+		return
+	}
+
 	g.blackListMu.Lock()
-	defer g.blackListMu.Unlock()
 
 	// 检查黑名单大小
 	if len(g.blackList) >= g.maxBlacklistSize {
@@ -499,6 +574,9 @@ func (g *GFW) addToBlacklist(ip string) {
 
 	//g.blackList[ip] = time.Now().Add(g.TTL)
 	g.blackList[ip] = time.Now().Add(time.Duration(g.TTL))
+	setGauge(blacklistSize, float64(len(g.blackList)))
+	g.blackListMu.Unlock()
+
 	// 异步保存黑名单
 	go func() {
 		if err := g.saveBlacklist(); err != nil {
@@ -531,30 +609,32 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 	// 获取请求信息
 	userAgent := r.UserAgent()
 	requestPath := r.URL.Path
-	// 	clientIP := r.RemoteAddr
-	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		clientIP = r.RemoteAddr
-	}
+	clientIP := clientIPFromRequest(r)
 	// 使用规则缓存进行匹配（基本安全检测）
-	if g.ruleCache != nil {
-		if g.ruleCache.MatchIP(clientIP) {
-			ruleMatches.WithLabelValues("ip").Inc()
+	if ruleCache := g.getRuleCache(); ruleCache != nil {
+		if ruleCache.MatchIP(clientIP) {
+			incCounter(ruleMatches, "ip")
 			g.logger.Info("IP rule matched", zap.String("client_ip", clientIP))
 			return "ip_rule", false
 		}
 
-		if g.ruleCache.MatchURL(requestPath) {
-			ruleMatches.WithLabelValues("url").Inc()
+		if ruleCache.MatchURL(requestPath) {
+			incCounter(ruleMatches, "url")
 			g.logger.Info("URL path rule matched", zap.String("path", requestPath))
 			return "url_rule", false
 		}
 
-		if g.ruleCache.MatchUserAgent(userAgent) {
-			ruleMatches.WithLabelValues("ua").Inc()
+		if ruleCache.MatchUserAgent(userAgent) {
+			incCounter(ruleMatches, "ua")
 			g.logger.Info("User-Agent rule matched", zap.String("user_agent", userAgent))
 			return "ua_rule", false
 		}
+	}
+
+	// 如果是直接使用IP访问，则认为请求不合法
+	if g.EnableIPCheck && isDirectIPHost(r.Host) {
+		incCounter(attackDetections, "direct_ip_access")
+		return "direct_ip_access", false
 	}
 
 	// 如果额外安全检测被禁用，直接返回true
@@ -564,70 +644,53 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 
 	// 检查SQL注入
 	if g.detectSQLInjection(r) {
-		attackDetections.WithLabelValues("sql_injection").Inc()
+		incCounter(attackDetections, "sql_injection")
 		g.logger.Warn("detected SQL injection attack", zap.String("ip", clientIP))
 		return "sql_injection", false
 	}
 
 	// 检查XSS攻击
 	if g.detectXSS(r) {
-		attackDetections.WithLabelValues("xss").Inc()
+		incCounter(attackDetections, "xss")
 		g.logger.Warn("detected XSS attack", zap.String("ip", clientIP))
 		return "xss", false
 	}
 
-	// 检查CSRF攻击
-	if g.detectCSRF(r) {
-		attackDetections.WithLabelValues("csrf").Inc()
-		g.logger.Warn("detected CSRF attack", zap.String("ip", clientIP))
-		return "csrf", false
-	}
+	//// 检查CSRF攻击
+	//if g.detectCSRF(r) {
+	//	attackDetections.WithLabelValues("csrf").Inc()
+	//	g.logger.Warn("detected CSRF attack", zap.String("ip", clientIP))
+	//	return "csrf", false
+	//}
 
 	// 检查SSRF攻击
 	if g.detectSSRF(r) {
-		attackDetections.WithLabelValues("ssrf").Inc()
+		incCounter(attackDetections, "ssrf")
 		g.logger.Warn("detected SSRF attack", zap.String("ip", clientIP))
 		return "ssrf", false
 	}
 
 	// 检查命令注入
 	if g.detectCommandInjection(r) {
-		attackDetections.WithLabelValues("command_injection").Inc()
+		incCounter(attackDetections, "command_injection")
 		g.logger.Warn("detected command injection attack", zap.String("ip", clientIP))
 		return "command_injection", false
 	}
 
 	// 检查代码注入
 	if g.detectCodeInjection(r) {
-		attackDetections.WithLabelValues("code_injection").Inc()
+		incCounter(attackDetections, "code_injection")
 		g.logger.Warn("detected code injection attack", zap.String("ip", clientIP))
 		return "code_injection", false
 	}
 
 	// 检查文件包含漏洞
 	if g.detectFileInclude(r) {
-		attackDetections.WithLabelValues("file_include").Inc()
+		incCounter(attackDetections, "file_include")
 		g.logger.Warn("detected file inclusion vulnerability", zap.String("ip", clientIP))
 		return "file_include", false
 	}
 
-	// 检查是否直接使用IP访问80或443端口（没有配置域名）
-	host := r.Host
-	// 检查Host是否为IP地址格式（简单判断是否包含字母）
-	isIP := true
-	for _, c := range host {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			isIP = false
-			break
-		}
-	}
-	if !g.DisableIPCheck {
-		// 如果是直接使用IP访问，则认为请求不合法
-		if isIP {
-			attackDetections.WithLabelValues("direct_ip_access").Inc()
-			return "direct_ip_access", false
-		}
-	}
 	// 默认认为请求合法
 	return "", true
 }
@@ -680,53 +743,53 @@ func (g *GFW) detectSQLInjection(r *http.Request) bool {
 	}
 
 	// 检查POST数据
-	if r.Method == "POST" {
-		if err := r.ParseForm(); err == nil {
-			for key, values := range r.PostForm {
-				for _, value := range values {
-					// 检查完整的参数值
-					fullValue := key + "=" + value
-					lowerValue := strings.ToLower(fullValue)
-					if strings.Contains(lowerValue, "drop table") {
-						return true
-					}
-
-					// 检查SQL注入模式
-					if sqlInjectionRegex.MatchString(value) {
-						return true
-					}
-
-					// 检查分号后的SQL命令
-					if strings.Contains(value, ";") {
-						// 处理形如 "id=1; DROP TABLE users" 的情况
-						if strings.Contains(strings.ToLower(value), "drop table") {
-							return true
-						}
-						// 处理其他SQL命令
-						parts := strings.Split(value, ";")
-						for _, part := range parts {
-							part = strings.TrimSpace(part)
-							if part == "" {
-								continue
-							}
-							// 检查DROP TABLE命令
-							if strings.Contains(strings.ToLower(part), "drop table") {
-								return true
-							}
-							// 检查其他SQL命令
-							if sqlInjectionRegex.MatchString(part) {
-								return true
-							}
-						}
-					}
-					// 检查参数名
-					if sqlInjectionRegex.MatchString(key) {
-						return true
-					}
-				}
-			}
-		}
-	}
+	//if r.Method == "POST" {
+	//	if err := r.ParseForm(); err == nil {
+	//		for key, values := range r.PostForm {
+	//			for _, value := range values {
+	//				// 检查完整的参数值
+	//				fullValue := key + "=" + value
+	//				lowerValue := strings.ToLower(fullValue)
+	//				if strings.Contains(lowerValue, "drop table") {
+	//					return true
+	//				}
+	//
+	//				// 检查SQL注入模式
+	//				if sqlInjectionRegex.MatchString(value) {
+	//					return true
+	//				}
+	//
+	//				// 检查分号后的SQL命令
+	//				if strings.Contains(value, ";") {
+	//					// 处理形如 "id=1; DROP TABLE users" 的情况
+	//					if strings.Contains(strings.ToLower(value), "drop table") {
+	//						return true
+	//					}
+	//					// 处理其他SQL命令
+	//					parts := strings.Split(value, ";")
+	//					for _, part := range parts {
+	//						part = strings.TrimSpace(part)
+	//						if part == "" {
+	//							continue
+	//						}
+	//						// 检查DROP TABLE命令
+	//						if strings.Contains(strings.ToLower(part), "drop table") {
+	//							return true
+	//						}
+	//						// 检查其他SQL命令
+	//						if sqlInjectionRegex.MatchString(part) {
+	//							return true
+	//						}
+	//					}
+	//				}
+	//				// 检查参数名
+	//				if sqlInjectionRegex.MatchString(key) {
+	//					return true
+	//				}
+	//			}
+	//		}
+	//	}
+	//}
 
 	// 检查原始查询字符串
 	rawQuery := r.URL.RawQuery
@@ -888,7 +951,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 			}
 		}
 	}
-	return false
+
 	// 检查请求头
 	for _, header := range r.Header {
 		for _, value := range header {
@@ -1108,9 +1171,13 @@ func (g *GFW) loadRulesFromFile() error {
 
 	// 创建新的规则缓存
 	newCache := NewRuleCache()
+	for _, rule := range g.inlineRules {
+		newCache.AddRule(rule)
+	}
 
 	// 逐行读取规则
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	lineCount := 0
 	ruleCount := 0
 
@@ -1134,10 +1201,10 @@ func (g *GFW) loadRulesFromFile() error {
 	}
 
 	// 更新规则缓存
-	g.ruleCache = newCache
+	g.setRuleCache(newCache)
 
 	// 更新内存中的规则列表
-	g.BlockRules = make([]string, 0, ruleCount)
+	g.BlockRules = make([]string, 0, len(g.inlineRules)+ruleCount)
 	for rule := range newCache.GetAllRules() {
 		g.BlockRules = append(g.BlockRules, rule)
 	}
@@ -1222,6 +1289,16 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.Url = h.Val()
 
+			case "enable_ip_check":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				enable, err := strconv.ParseBool(h.Val())
+				if err != nil {
+					return nil, h.Errf("invalid enable_ip_check value: %v", err)
+				}
+				g.EnableIPCheck = enable
+
 			default:
 				return nil, h.Errf("unknown subdirective '%s'", h.Val())
 			}
@@ -1301,8 +1378,16 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				g.Url = d.Val()
 
-			case "disable_ip_check":
-				g.DisableIPCheck = true
+			case "enable_ip_check":
+				if d.NextArg() {
+					v, err := strconv.ParseBool(d.Val())
+					if err != nil {
+						return d.Errf("invalid enable_ip_check value: %s", d.Val())
+					}
+					g.EnableIPCheck = v
+				} else {
+					g.EnableIPCheck = true
+				}
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
@@ -1354,22 +1439,28 @@ func (g *GFW) loadBlacklist() error {
 // saveBlacklist 保存黑名单到存储
 func (g *GFW) saveBlacklist() error {
 	g.blackListMu.RLock()
-	defer g.blackListMu.RUnlock()
-
-	blacklist := make(map[string]string)
-	for ip, expireTime := range g.blackList {
-		blacklist[ip] = expireTime.Format(time.RFC3339)
+	entries := make([]struct {
+		IP     string
+		Expire time.Time
+	}, 0, len(g.blackList))
+	for ip, expire := range g.blackList {
+		entries = append(entries, struct {
+			IP     string
+			Expire time.Time
+		}{ip, expire})
 	}
-
-	data, err := json.Marshal(blacklist)
+	g.blackListMu.RUnlock()
+	snapshot := make(map[string]string, len(entries))
+	for _, e := range entries {
+		snapshot[e.IP] = e.Expire.Format(time.RFC3339)
+	}
+	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("failed to serialize blacklist: %w", err)
 	}
-
 	if err := g.storage.Store("blacklist.json", data); err != nil {
 		return fmt.Errorf("failed to save blacklist: %w", err)
 	}
-
 	return nil
 }
 
