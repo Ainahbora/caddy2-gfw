@@ -629,7 +629,7 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 		attackDetections.WithLabelValues("direct_ip_access").Inc()
 		return "direct_ip_access", false
 	}
-	
+
 	// 默认认为请求合法
 	return "", true
 }
@@ -1158,7 +1158,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	var g GFW
 	g.EnableExtra = false // 默认禁用额外安全检测
 	g.BlockAll = false    // 默认只拦截单次请求
-
+	g.EnableIPCheck = false
 	for h.Next() {
 		// 解析配置参数
 		for h.NextBlock(0) {
@@ -1247,7 +1247,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	g.EnableExtra = false // 默认禁用额外安全检测
 	g.BlockAll = false    // 默认只拦截单次请求
-
+	g.EnableIPCheck = false
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
