@@ -95,14 +95,15 @@ func init() {
 // GFW 实现了一个Caddy HTTP处理器，用于检测恶意请求
 type GFW struct {
 	// 配置选项
-	BlockRules    []string      `json:"block_rules,omitempty"`
-	BlockRuleFile string        `json:"block_rule_file,omitempty"`
-	TTL           caddy.Duration `json:"ttl,omitempty"`
-	EnableExtra   bool          `json:"enable_extra,omitempty"`           // 是否启用额外安全检测
-	BlockAll      bool          `json:"block_all,omitempty"`              // 规则匹配时是否拦截所有请求
-	Message       string        `json:"message,omitempty"`                // 自定义消息
-	RawResponder  string        `json:"raw_responder,omitempty"`          // 拦截模式
-    Url           string        `json:"url,omitempty"`                    // 反弹地址
+	BlockRules     []string       `json:"block_rules,omitempty"`
+	BlockRuleFile  string         `json:"block_rule_file,omitempty"`
+	TTL            caddy.Duration `json:"ttl,omitempty"`
+	EnableExtra    bool           `json:"enable_extra,omitempty"` // 是否启用额外安全检测
+	DisableIPCheck bool           `json:"disable_ip_check,omitempty"`
+	BlockAll       bool           `json:"block_all,omitempty"`     // 规则匹配时是否拦截所有请求
+	Message        string         `json:"message,omitempty"`       // 自定义消息
+	RawResponder   string         `json:"raw_responder,omitempty"` // 拦截模式
+	Url            string         `json:"url,omitempty"`           // 反弹地址
 
 	// 内部状态
 	blackList        map[string]time.Time
@@ -175,9 +176,9 @@ func (rc *RuleCache) MatchURL(url string) bool {
 func (rc *RuleCache) MatchUserAgent(ua string) bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-// 	_, exists := rc.uaSet[ua]
-// 	return exists
-    for pattern := range rc.uaSet {
+	// 	_, exists := rc.uaSet[ua]
+	// 	return exists
+	for pattern := range rc.uaSet {
 		if strings.Contains(strings.ToLower(ua), strings.ToLower(pattern)) {
 			return true
 		}
@@ -221,20 +222,20 @@ func (g *GFW) Provision(ctx caddy.Context) error {
 		g.TTL = caddy.Duration(24 * time.Hour)
 	}
 
-    // 设置默认消息
-    if g.Message == "" {
-        g.Message = defaultMessage
-    }
+	// 设置默认消息
+	if g.Message == "" {
+		g.Message = defaultMessage
+	}
 
-    // 设置拦截类型
-    if g.RawResponder == "" {
-        g.RawResponder = defaultRawResponder
-    }
+	// 设置拦截类型
+	if g.RawResponder == "" {
+		g.RawResponder = defaultRawResponder
+	}
 
-    // 设置反弹地址
-    if g.Url == "" {
-        g.Url = defaultUrl
-    }
+	// 设置反弹地址
+	if g.Url == "" {
+		g.Url = defaultUrl
+	}
 
 	// 全局只注册一次 metrics
 	metricsOnce.Do(func() {
@@ -408,11 +409,11 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 
 	// 获取客户端IP
-// 	clientIP := r.RemoteAddr
-    clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-    if err != nil {
-        clientIP = r.RemoteAddr
-    }
+	// 	clientIP := r.RemoteAddr
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
 	// 检查IP是否在黑名单中
 	if g.isIPBlacklisted(clientIP) {
 		requestsTotal.WithLabelValues("blacklisted").Inc()
@@ -423,9 +424,9 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		// http.Error(w, "blocked by gfw", http.StatusForbidden)
 
 		if g.RawResponder == "redirect" {
-            http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
+			http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
 		} else {
-		    http.Error(w, g.Message, http.StatusForbidden)
+			http.Error(w, g.Message, http.StatusForbidden)
 		}
 
 		return nil
@@ -460,9 +461,9 @@ func (g *GFW) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		// http.Error(w, "blocked by gfw", http.StatusForbidden)
 
 		if g.RawResponder == "redirect" {
-            http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
+			http.Redirect(w, r, g.Url, http.StatusPermanentRedirect)
 		} else {
-		    http.Error(w, g.Message, http.StatusForbidden)
+			http.Error(w, g.Message, http.StatusForbidden)
 		}
 		return nil
 	}
@@ -497,7 +498,7 @@ func (g *GFW) addToBlacklist(ip string) {
 	}
 
 	//g.blackList[ip] = time.Now().Add(g.TTL)
-    g.blackList[ip] = time.Now().Add(time.Duration(g.TTL))
+	g.blackList[ip] = time.Now().Add(time.Duration(g.TTL))
 	// 异步保存黑名单
 	go func() {
 		if err := g.saveBlacklist(); err != nil {
@@ -530,11 +531,11 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 	// 获取请求信息
 	userAgent := r.UserAgent()
 	requestPath := r.URL.Path
-// 	clientIP := r.RemoteAddr
-    clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-    if err != nil {
-        clientIP = r.RemoteAddr
-    }
+	// 	clientIP := r.RemoteAddr
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
 	// 使用规则缓存进行匹配（基本安全检测）
 	if g.ruleCache != nil {
 		if g.ruleCache.MatchIP(clientIP) {
@@ -620,13 +621,13 @@ func (g *GFW) isRequestLegal(r *http.Request) (string, bool) {
 			break
 		}
 	}
-
-	// 如果是直接使用IP访问，则认为请求不合法
-	if isIP {
-		attackDetections.WithLabelValues("direct_ip_access").Inc()
-		return "direct_ip_access", false
+	if !g.DisableIPCheck {
+		// 如果是直接使用IP访问，则认为请求不合法
+		if isIP {
+			attackDetections.WithLabelValues("direct_ip_access").Inc()
+			return "direct_ip_access", false
+		}
 	}
-
 	// 默认认为请求合法
 	return "", true
 }
@@ -825,17 +826,17 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 		for _, value := range values {
 			// 检查命令注入模式
 			if cmdInjectionRegex.MatchString(value) {
-			    // g.logger.Error("检查命令注入模式", zap.String("value", value))
+				// g.logger.Error("检查命令注入模式", zap.String("value", value))
 				return true
 			}
 			// 检查管道符号
 			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
-			    // g.logger.Error("检查管道符号", zap.String("value", value))
+				// g.logger.Error("检查管道符号", zap.String("value", value))
 				return true
 			}
 			// 检查重定向符号
 			if strings.Contains(value, ">") || strings.Contains(value, "<") {
-			    // g.logger.Error("检查重定向符号", zap.String("value", value))
+				// g.logger.Error("检查重定向符号", zap.String("value", value))
 				return true
 			}
 			// 检查敏感文件路径
@@ -846,7 +847,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 			}
 			// 检查系统命令
 			if cmdInjectionRegex.MatchString(value) {
-			    // g.logger.Error("检查系统命令", zap.String("value", value))
+				// g.logger.Error("检查系统命令", zap.String("value", value))
 				return true
 			}
 		}
@@ -859,17 +860,17 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 				for _, value := range values {
 					// 检查命令注入模式
 					if cmdInjectionRegex.MatchString(value) {
-					    // g.logger.Error("POST 检查命令注入模式", zap.String("value", value))
+						// g.logger.Error("POST 检查命令注入模式", zap.String("value", value))
 						return true
 					}
 					// 检查管道符号
 					if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
-					    // g.logger.Error("POST 检查管道符号", zap.String("value", value))
+						// g.logger.Error("POST 检查管道符号", zap.String("value", value))
 						return true
 					}
 					// 检查重定向符号
 					if strings.Contains(value, ">") || strings.Contains(value, "<") {
-					    // g.logger.Error("POST 检查重定向符号", zap.String("value", value))
+						// g.logger.Error("POST 检查重定向符号", zap.String("value", value))
 						return true
 					}
 					// 检查敏感文件路径
@@ -880,30 +881,30 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 					}
 					// 检查系统命令
 					if cmdInjectionRegex.MatchString(value) {
-					    // g.logger.Error("POST 检查系统命令", zap.String("value", value))
+						// g.logger.Error("POST 检查系统命令", zap.String("value", value))
 						return true
 					}
 				}
 			}
 		}
 	}
-    return false
+	return false
 	// 检查请求头
 	for _, header := range r.Header {
 		for _, value := range header {
 			// 检查命令注入模式
 			if cmdInjectionRegex.MatchString(value) {
-			    g.logger.Error("header 检查命令注入模式", zap.String("value", value))
+				g.logger.Error("header 检查命令注入模式", zap.String("value", value))
 				return true
 			}
 			// 检查管道符号
 			if strings.Contains(value, "|") || strings.Contains(value, "&") || strings.Contains(value, ";") {
-			    g.logger.Error("header 检查管道符号", zap.String("value", value))
+				g.logger.Error("header 检查管道符号", zap.String("value", value))
 				return true
 			}
 			// 检查重定向符号
 			if strings.Contains(value, ">") || strings.Contains(value, "<") {
-			    g.logger.Error("header 检查重定向符号", zap.String("value", value))
+				g.logger.Error("header 检查重定向符号", zap.String("value", value))
 				return true
 			}
 			// 检查敏感文件路径
@@ -914,7 +915,7 @@ func (g *GFW) detectCommandInjection(r *http.Request) bool {
 			}
 			// 检查系统命令
 			if cmdInjectionRegex.MatchString(value) {
-			    g.logger.Error("header 检查系统命令", zap.String("value", value))
+				g.logger.Error("header 检查系统命令", zap.String("value", value))
 				return true
 			}
 		}
@@ -1176,13 +1177,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				if !h.NextArg() {
 					return nil, h.ArgErr()
 				}
-// 				duration, err := time.ParseDuration(h.Val())
-                duration, err := caddy.ParseDuration(h.Val())
+				// 				duration, err := time.ParseDuration(h.Val())
+				duration, err := caddy.ParseDuration(h.Val())
 				if err != nil {
 					return nil, h.Errf("invalid ttl duration: %v", err)
 				}
-// 				g.TTL = duration
-                g.TTL = caddy.Duration(duration)
+				// 				g.TTL = duration
+				g.TTL = caddy.Duration(duration)
 			case "enable_extra":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
@@ -1203,19 +1204,19 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 				g.BlockAll = blockAll
 
-            case "message":
+			case "message":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
 				}
 				g.Message = h.Val()
 
-            case "raw_responder":
+			case "raw_responder":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
 				}
 				g.RawResponder = h.Val()
 
-			 case "url":
+			case "url":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
 				}
@@ -1254,13 +1255,13 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-// 				duration, err := time.ParseDuration(d.Val())
+				// 				duration, err := time.ParseDuration(d.Val())
 				duration, err := caddy.ParseDuration(d.Val())
 				if err != nil {
 					return d.Errf("invalid ttl duration: %v", err)
 				}
-// 				g.TTL = duration
-                g.TTL = caddy.Duration(duration)
+				// 				g.TTL = duration
+				g.TTL = caddy.Duration(duration)
 
 			case "enable_extra":
 				if !d.NextArg() {
@@ -1282,23 +1283,26 @@ func (g *GFW) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				g.BlockAll = blockAll
 
-            case "message":
+			case "message":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				g.Message = d.Val()
 
-             case "raw_responder":
+			case "raw_responder":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				g.RawResponder = d.Val()
 
-			 case "url":
+			case "url":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				g.Url = d.Val()
+
+			case "disable_ip_check":
+				g.DisableIPCheck = true
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
