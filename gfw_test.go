@@ -1,8 +1,10 @@
 package gfw
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,6 +112,16 @@ func TestGFW_SQLInjection(t *testing.T) {
 				t.Errorf("SQL注入检测失败: %s", tt.query)
 			}
 		})
+	}
+}
+
+func TestGFW_SQLInjectionPostForm(t *testing.T) {
+	g := setupGFW(t)
+	req := httptest.NewRequest("POST", "/", strings.NewReader("id=1%27+OR+%271%27%3D%271"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if !g.detectSQLInjection(req) {
+		t.Error("POST 表单 SQL 注入应该被检测")
 	}
 }
 
@@ -414,6 +426,58 @@ func TestGFW_ServeHTTP(t *testing.T) {
 				t.Errorf("期望状态码 %d, 实际状态码 %d", tt.expectedStatus, recorder.Code)
 			}
 		})
+	}
+}
+
+func TestGFW_ServeHTTPPreservesAllowedPostBody(t *testing.T) {
+	g := setupGFW(t)
+	g.EnableExtra = true
+
+	body := "name=alice"
+	req := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "192.0.2.20:1234"
+	recorder := httptest.NewRecorder()
+
+	var downstreamBody string
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		downstreamBody = string(data)
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+
+	if err := g.ServeHTTP(recorder, req, next); err != nil {
+		t.Fatalf("ServeHTTP failed: %v", err)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("期望状态码 %d, 实际状态码 %d", http.StatusOK, recorder.Code)
+	}
+	if downstreamBody != body {
+		t.Fatalf("下游读取到的 body = %q, 期望 %q", downstreamBody, body)
+	}
+}
+
+func TestInspectRequestSkipsOversizedBody(t *testing.T) {
+	body := "name=alice"
+	req := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.ContentLength = defaultMaxFormBodySize + 1
+
+	inspection := inspectRequest(req)
+	if len(inspection.post) != 0 {
+		t.Fatal("超大请求体不应该被解析为 POST 表单")
+	}
+
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("读取 body 失败: %v", err)
+	}
+	if string(data) != body {
+		t.Fatalf("body = %q, 期望 %q", string(data), body)
 	}
 }
 
